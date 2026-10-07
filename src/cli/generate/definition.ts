@@ -10,6 +10,7 @@ import {
   type ServerLoggingOptions,
   type StdioCommand,
 } from '../../config.js';
+import { type VaultEncryptionPolicy, VaultEncryptionPolicySchema } from '../../config-schema.js';
 import { resolveLifecycle } from '../../lifecycle.js';
 import type { Runtime, ServerToolInfo } from '../../runtime.js';
 import { createRuntime } from '../../runtime.js';
@@ -64,6 +65,7 @@ export async function resolveServerDefinition(
     const buffer = await fs.readFile(possiblePath, 'utf8');
     const parsed = JSON.parse(buffer) as {
       mcpServers?: Record<string, unknown>;
+      oauthVaultEncryption?: unknown;
     };
     if (!parsed.mcpServers || typeof parsed.mcpServers !== 'object') {
       throw new Error(`Config file ${possiblePath} does not contain mcpServers.`);
@@ -81,6 +83,8 @@ export async function resolveServerDefinition(
       definition: normalizeDefinition({
         name,
         ...(value as Record<string, unknown>),
+        // The top-level policy applies to every server, as loadServerDefinitions does.
+        ...(parsed.oauthVaultEncryption === undefined ? {} : { oauthVaultEncryption: parsed.oauthVaultEncryption }),
       }),
       name,
     };
@@ -208,6 +212,7 @@ export function normalizeDefinition(def: DefinitionInput): ServerDefinition {
   const oauthClientMetadataUrl = stringFromAliases(record, 'oauthClientMetadataUrl', 'oauth_client_metadata_url');
   const oauthScope = stringFromAliases(record, 'oauthScope', 'oauth_scope');
   const oauthRequestedScope = stringFromAliases(record, 'oauthRequestedScope', 'oauth_requested_scope');
+  const oauthVaultEncryption = getVaultEncryptionPolicy(record.oauthVaultEncryption ?? record.oauth_vault_encryption);
   const refresh = getRefresh(record.refresh);
   const httpFetch = normalizeHttpFetch(stringFromAliases(record, 'httpFetch', 'http_fetch'));
   const headers = toStringRecord((def as Record<string, unknown>).headers);
@@ -239,6 +244,7 @@ export function normalizeDefinition(def: DefinitionInput): ServerDefinition {
     oauthCommand,
     refresh,
     httpFetch,
+    ...(oauthVaultEncryption === undefined ? {} : { oauthVaultEncryption }),
     lifecycle: resolveLifecycle(name, rawLifecycle, command),
     logging,
     ...(allowedTools !== undefined ? { allowedTools } : {}),
@@ -425,6 +431,15 @@ function getProtocolVersion(value: unknown): ServerDefinition['protocolVersion']
 
 function getChromeDevtoolsRelayPolicy(value: unknown): ServerDefinition['chromeDevtoolsRelay'] | undefined {
   return value === 'off' || value === 'prefer' || value === 'require' ? value : undefined;
+}
+
+// A generated CLI embeds its definition, so the policy must survive here or
+// a `required` configuration silently becomes `optional` in the artifact.
+function getVaultEncryptionPolicy(value: unknown): VaultEncryptionPolicy | undefined {
+  if (value === undefined) return undefined;
+  const parsed = VaultEncryptionPolicySchema.safeParse(value);
+  if (!parsed.success) throw new Error("oauthVaultEncryption must be 'optional' or 'required'.");
+  return parsed.data;
 }
 
 function stringFromAliases(record: Record<string, unknown>, ...keys: string[]): string | undefined {
