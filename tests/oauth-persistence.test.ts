@@ -2715,7 +2715,12 @@ describe('vault encryption at rest', () => {
     const store = new DirectoryPersistence(cacheDir);
     await store.saveTokens({ access_token: 'dir-access', token_type: 'Bearer' });
     const gate = Promise.withResolvers<void>();
-    const lockHeld = withFileLock(tokensPath, () => gate.promise);
+    const acquired = Promise.withResolvers<void>();
+    const lockHeld = withFileLock(tokensPath, async () => {
+      acquired.resolve();
+      await gate.promise;
+    });
+    await acquired.promise;
     const cleared = store.clear('all');
     await new Promise((resolve) => setTimeout(resolve, 50));
     await expect(fs.access(tokensPath)).resolves.toBeUndefined();
@@ -2723,6 +2728,74 @@ describe('vault encryption at rest', () => {
     await lockHeld;
     await cleared;
     await expect(fs.access(tokensPath)).rejects.toThrow();
+  });
+
+  it('refuses every write to a sealed tokenCacheDir without a password and leaves it untouched', async () => {
+    const cacheDir = path.join(dir, 'cache-downgrade');
+    const d = mkDef('cached-downgrade', cacheDir);
+    process.env.MCPORTER_VAULT_PASSWORD = PASSWORD;
+    const store = new DirectoryPersistence(cacheDir, undefined, 'https://example.com/mcp');
+    await store.saveTokens({ access_token: 'dir-access', refresh_token: 'dir-refresh', token_type: 'Bearer' });
+    await store.saveClientInfo({ client_id: 'dir-client', client_secret: 'dir-secret' });
+    const snapshot = async () =>
+      Object.fromEntries(
+        await Promise.all(
+          (await fs.readdir(cacheDir))
+            .toSorted()
+            .map(async (f) => [f, await fs.readFile(path.join(cacheDir, f), 'utf8')])
+        )
+      );
+    const before = await snapshot();
+    delete process.env.MCPORTER_VAULT_PASSWORD;
+    await expect(store.saveTokens({ access_token: 'plain', token_type: 'Bearer' })).rejects.toMatchObject({
+      code: 'password_missing',
+    });
+    await expect(
+      store.saveDiscoveryState({ authorizationServerUrl: 'https://auth.example.com' })
+    ).rejects.toMatchObject({ code: 'password_missing' });
+    // The composite path the SDK uses: the directory refuses on its own, before the vault answers.
+    const persistence = await buildOAuthPersistence(d);
+    await expect(persistence.saveTokens({ access_token: 'plain', token_type: 'Bearer' })).rejects.toMatchObject({
+      code: 'password_missing',
+    });
+    // Deleting is a modification too; the vault refuses it the same way.
+    await expect(store.clear('all')).rejects.toMatchObject({ code: 'password_missing' });
+    expect(await snapshot()).toEqual(before);
+  });
+
+  it('refuses to invalidate a sealed tokenCacheDir on a server URL change without a password', async () => {
+    const cacheDir = path.join(dir, 'cache-url-change');
+    process.env.MCPORTER_VAULT_PASSWORD = PASSWORD;
+    await new DirectoryPersistence(cacheDir, undefined, 'https://a.example.com/mcp').saveTokens({
+      access_token: 'dir-access',
+      token_type: 'Bearer',
+    });
+    delete process.env.MCPORTER_VAULT_PASSWORD;
+    const moved = new DirectoryPersistence(cacheDir, undefined, 'https://b.example.com/mcp');
+    await expect(moved.readTokens()).rejects.toMatchObject({ code: 'password_missing' });
+    await expect(fs.access(path.join(cacheDir, 'tokens.json'))).resolves.toBeUndefined();
+    expect((await fs.readFile(path.join(cacheDir, 'server_url.txt'), 'utf8')).trim()).toBe('https://a.example.com/mcp');
+  });
+
+  it('seals a plaintext tokenCacheDir on a metadata save with a password', async () => {
+    const cacheDir = path.join(dir, 'cache-metadata-sweep');
+    const store = new DirectoryPersistence(cacheDir, undefined, 'https://example.com/mcp');
+    await store.saveTokens({ access_token: 'dir-access', refresh_token: 'dir-refresh', token_type: 'Bearer' });
+    await store.saveClientInfo({ client_id: 'dir-client', client_secret: 'dir-secret' });
+    process.env.MCPORTER_VAULT_PASSWORD = PASSWORD;
+    await store.saveResourceUrl('https://example.com/mcp');
+    const tokens = (await readJsonFile<{ access_token: string; refresh_token: string }>(
+      path.join(cacheDir, 'tokens.json')
+    ))!;
+    const client = (await readJsonFile<{ client_secret: string }>(path.join(cacheDir, 'client.json')))!;
+    expect(isVaultSecretJwe(tokens.access_token)).toBe(true);
+    expect(isVaultSecretJwe(tokens.refresh_token)).toBe(true);
+    expect(isVaultSecretJwe(client.client_secret)).toBe(true);
+    await expect(store.readSnapshot()).resolves.toMatchObject({
+      tokens: { access_token: 'dir-access' },
+      clientInfo: { client_secret: 'dir-secret' },
+      resourceUrl: 'https://example.com/mcp',
+    });
   });
 
   it('does not let a plaintext tokenCacheDir hide a sealed vault without a password', async () => {
