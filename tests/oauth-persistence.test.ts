@@ -5,13 +5,13 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { OAuthTokens } from '@modelcontextprotocol/client';
 import type { ServerDefinition } from '../src/config.js';
-import { readJsonFile } from '../src/fs-json.js';
+import { readJsonFile, withFileLock } from '../src/fs-json.js';
 import { buildOAuthPersistence, clearOAuthCaches, readCachedAccessToken } from '../src/oauth-persistence.js';
 import { withRefreshLock } from '../src/oauth-refresh-lock.js';
 import { clearVaultEntry, loadVaultEntry, saveVaultEntry, vaultKeyForDefinition } from '../src/oauth-vault.js';
 import { getOAuthVaultPath } from '../src/oauth-vault.js';
 import { isVaultSecretJwe, openVaultSecret, sealVaultSecret, vaultSecretKid } from '../src/oauth-vault-encryption.js';
-import { DirectoryPersistence } from '../src/oauth-persistence-stores.js';
+import { DirectoryPersistence, clearLegacyOAuthArtifacts } from '../src/oauth-persistence-stores.js';
 
 const authMocks = vi.hoisted(() => ({
   discoverOAuthServerInfo: vi.fn(),
@@ -1118,9 +1118,10 @@ describe('oauth persistence', () => {
     );
 
     await expect(readCachedAccessToken(definition)).resolves.toBeUndefined();
-    // Legacy files are moved into the vault, not copied (spec § "Design", Scope).
+    // Without a vault password the legacy copy is kept as before; only the
+    // rejected tokens are cleared.
     await expect(readJsonFile(path.join(legacyDir, 'tokens.json'))).resolves.toBeUndefined();
-    await expect(readJsonFile(path.join(legacyDir, 'client.json'))).resolves.toBeUndefined();
+    await expect(readJsonFile(path.join(legacyDir, 'client.json'))).resolves.toEqual({ client_id: 'client-123' });
 
     authMocks.refreshAuthorization.mockClear();
     await expect(readCachedAccessToken(definition)).resolves.toBeUndefined();
@@ -2669,7 +2670,116 @@ describe('vault encryption at rest', () => {
     await expect(fs.access(path.join(cacheDir, 'client.json'))).rejects.toThrow();
   });
 
-  it('moves a legacy per-server cache into the vault and removes it', async () => {
+  it('refuses a plaintext tokenCacheDir under required without a password', async () => {
+    const cacheDir = path.join(dir, 'cache-required');
+    const d = mkDef('cached-required', cacheDir);
+    const store = new DirectoryPersistence(cacheDir, undefined, 'https://example.com/mcp');
+    await store.saveTokens({ access_token: 'dir-access', token_type: 'Bearer' });
+    process.env.MCPORTER_VAULT_ENCRYPTION = 'required';
+    const persistence = await buildOAuthPersistence(d);
+    await expect(persistence.readTokens()).rejects.toMatchObject({ code: 'password_missing' });
+    await expect(persistence.readSnapshot()).rejects.toMatchObject({ code: 'password_missing' });
+    await expect(persistence.saveState('x')).rejects.toMatchObject({ code: 'password_missing' });
+    await expect(readCachedAccessToken(d)).rejects.toMatchObject({ code: 'password_missing' });
+  });
+
+  it('refuses every tokenCacheDir operation under a config required policy without a password', async () => {
+    const cacheDir = path.join(dir, 'cache-required-direct');
+    const store = new DirectoryPersistence(cacheDir, undefined, 'https://example.com/mcp', false, 'required');
+    await expect(store.readTokens()).rejects.toMatchObject({ code: 'password_missing' });
+    await expect(store.saveState('x')).rejects.toMatchObject({ code: 'password_missing' });
+    await expect(store.clear('all')).rejects.toMatchObject({ code: 'password_missing' });
+    await expect(fs.access(cacheDir)).rejects.toThrow();
+    // The composite's first-value reads never reach the vault, so the directory must refuse on its own.
+    const d = { ...mkDef('cached-required-reads', cacheDir), oauthVaultEncryption: 'required' as const };
+    const persistence = await buildOAuthPersistence(d);
+    await expect(persistence.readCodeVerifier()).rejects.toMatchObject({ code: 'password_missing' });
+    await expect(persistence.readState()).rejects.toMatchObject({ code: 'password_missing' });
+  });
+
+  it('refuses to clear legacy artifacts under a config required policy without a password', async () => {
+    vi.spyOn(os, 'homedir').mockReturnValue(dir);
+    const d = { ...mkDef('req-legacy-clear'), oauthVaultEncryption: 'required' as const };
+    const legacyTokens = path.join(dir, '.mcporter', d.name, 'tokens.json');
+    await fs.mkdir(path.dirname(legacyTokens), { recursive: true });
+    await fs.writeFile(legacyTokens, JSON.stringify({ access_token: 'legacy', token_type: 'Bearer' }), 'utf8');
+    await expect(clearLegacyOAuthArtifacts(d, undefined, 'all')).rejects.toMatchObject({ code: 'password_missing' });
+    await expect(fs.access(legacyTokens)).resolves.toBeUndefined();
+  });
+
+  it('clears a tokenCacheDir under the lock the sealing writes hold', async () => {
+    // Without the lock a concurrent first-sealing save could read a file, lose
+    // the race to clear's unlink, and write the sealed copy back.
+    const cacheDir = path.join(dir, 'cache-clear-lock');
+    const tokensPath = path.join(cacheDir, 'tokens.json');
+    const store = new DirectoryPersistence(cacheDir);
+    await store.saveTokens({ access_token: 'dir-access', token_type: 'Bearer' });
+    const gate = Promise.withResolvers<void>();
+    const lockHeld = withFileLock(tokensPath, () => gate.promise);
+    const cleared = store.clear('all');
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await expect(fs.access(tokensPath)).resolves.toBeUndefined();
+    gate.resolve();
+    await lockHeld;
+    await cleared;
+    await expect(fs.access(tokensPath)).rejects.toThrow();
+  });
+
+  it('does not let a plaintext tokenCacheDir hide a sealed vault without a password', async () => {
+    const cacheDir = path.join(dir, 'cache-hides-vault');
+    const d = mkDef('cached-hides-vault', cacheDir);
+    await seed({ [vaultKeyForDefinition(d)]: await vaultSealedEntry(d, PASSWORD) });
+    const store = new DirectoryPersistence(cacheDir, undefined, 'https://example.com/mcp');
+    await store.saveTokens({ access_token: 'dir-access', token_type: 'Bearer' });
+    await store.saveClientInfo({ client_id: 'dir-client' });
+    const persistence = await buildOAuthPersistence(d);
+    await expect(persistence.readTokens()).rejects.toMatchObject({ code: 'password_missing' });
+    await expect(persistence.readClientInfo()).rejects.toMatchObject({ code: 'password_missing' });
+    await expect(readCachedAccessToken(d)).rejects.toMatchObject({ code: 'password_missing' });
+  });
+
+  it('seals every plaintext secret file in a tokenCacheDir on the first write with a password', async () => {
+    const cacheDir = path.join(dir, 'cache-sweep');
+    const store = new DirectoryPersistence(cacheDir, undefined, 'https://example.com/mcp');
+    await store.saveTokens({ access_token: 'dir-access', refresh_token: 'dir-refresh', token_type: 'Bearer' });
+    await store.saveClientInfo({ client_id: 'dir-client', client_secret: 'dir-secret' });
+    await store.saveCodeVerifier('verifier-plain');
+    process.env.MCPORTER_VAULT_PASSWORD = PASSWORD;
+    await store.saveState('state-plain');
+    const readFiles = async () => ({
+      tokens: (await readJsonFile<{ access_token: string; refresh_token: string }>(
+        path.join(cacheDir, 'tokens.json')
+      ))!,
+      client: (await readJsonFile<{ client_id: string; client_secret: string }>(path.join(cacheDir, 'client.json')))!,
+      verifier: (await fs.readFile(path.join(cacheDir, 'code_verifier.txt'), 'utf8')).trim(),
+      state: (await readJsonFile<string>(path.join(cacheDir, 'state.txt')))!,
+    });
+    const first = await readFiles();
+    expect(first.client.client_id).toBe('dir-client');
+    for (const [label, value] of [
+      ['tokens.json/access_token', first.tokens.access_token],
+      ['tokens.json/refresh_token', first.tokens.refresh_token],
+      ['client.json/client_secret', first.client.client_secret],
+      ['code_verifier.txt', first.verifier],
+      ['state.txt', first.state],
+    ] as const) {
+      expect(isVaultSecretJwe(value), label).toBe(true);
+    }
+    await expect(store.readSnapshot()).resolves.toMatchObject({
+      tokens: { access_token: 'dir-access', refresh_token: 'dir-refresh' },
+      clientInfo: { client_id: 'dir-client', client_secret: 'dir-secret' },
+      codeVerifier: 'verifier-plain',
+      state: 'state-plain',
+    });
+    // Already sealed files are left byte-identical by later writes.
+    await store.saveState('state-next');
+    const second = await readFiles();
+    expect(second.tokens).toEqual(first.tokens);
+    expect(second.client).toEqual(first.client);
+    expect(second.verifier).toBe(first.verifier);
+  });
+
+  it('moves a legacy per-server cache into the vault and removes it when a password is set', async () => {
     const d = mkDef('legacy-dir');
     const legacyDir = path.join(dir, '.mcporter', 'legacy-dir');
     vi.spyOn(os, 'homedir').mockReturnValue(dir);
@@ -2679,9 +2789,23 @@ describe('vault encryption at rest', () => {
       JSON.stringify({ access_token: 'legacy-access', refresh_token: 'legacy-refresh', token_type: 'Bearer' }),
       'utf8'
     );
+    process.env.MCPORTER_VAULT_PASSWORD = PASSWORD;
     await buildOAuthPersistence(d);
     await expect(loadVaultEntry(d)).resolves.toMatchObject({ tokens: { access_token: 'legacy-access' } });
+    expect(isVaultSecretJwe((await stored()).entries[vaultKeyForDefinition(d)]!.tokens.refresh_token)).toBe(true);
     await expect(fs.access(path.join(legacyDir, 'tokens.json'))).rejects.toThrow();
+  });
+
+  it('keeps the legacy per-server cache without a password, as before', async () => {
+    const d = mkDef('legacy-dir-plain');
+    const legacyDir = path.join(dir, '.mcporter', 'legacy-dir-plain');
+    vi.spyOn(os, 'homedir').mockReturnValue(dir);
+    await fs.mkdir(legacyDir, { recursive: true });
+    const tokens = { access_token: 'legacy-access', refresh_token: 'legacy-refresh', token_type: 'Bearer' };
+    await fs.writeFile(path.join(legacyDir, 'tokens.json'), JSON.stringify(tokens), 'utf8');
+    await buildOAuthPersistence(d);
+    await expect(loadVaultEntry(d)).resolves.toMatchObject({ tokens: { access_token: 'legacy-access' } });
+    await expect(readJsonFile(path.join(legacyDir, 'tokens.json'))).resolves.toEqual(tokens);
   });
 
   it('rejects a refresh whose vault write fails instead of returning the stale token', async () => {
