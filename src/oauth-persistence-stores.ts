@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import type { OAuthClientInformationMixed, OAuthDiscoveryState, OAuthTokens } from '@modelcontextprotocol/client';
 import type { ServerDefinition } from './config.js';
+import type { VaultEncryptionPolicy } from './config-schema.js';
 import { readJsonFile, withFileLock, writeJsonFile, writeTextFileAtomic } from './fs-json.js';
 import type { Logger } from './logging.js';
 import { isStoredOAuthClientInformation, isStoredOAuthTokens } from './oauth-credential-validation.js';
@@ -24,6 +25,14 @@ import {
   reconcileVaultServerUrl,
   saveVaultEntry,
 } from './oauth-vault.js';
+import {
+  VAULT_PASSWORD_ENV,
+  VaultEncryptionError,
+  isVaultSecretJwe,
+  openVaultSecret,
+  readVaultEncryptionSettings,
+  sealVaultSecret,
+} from './oauth-vault-encryption.js';
 import { runtimeHome } from './runtime/environment.js';
 
 type StoredOAuthTokens = OAuthTokens & {
@@ -63,7 +72,8 @@ export class DirectoryPersistence implements OAuthPersistence {
     private readonly root: string,
     private readonly logger?: Logger,
     private readonly serverUrl?: string,
-    private readonly skipUrlMarkerWhenMissing = false
+    private readonly skipUrlMarkerWhenMissing = false,
+    private readonly vaultPolicy?: VaultEncryptionPolicy
   ) {
     this.tokenPath = path.join(root, 'tokens.json');
     this.clientInfoPath = path.join(root, 'client.json');
@@ -81,6 +91,59 @@ export class DirectoryPersistence implements OAuthPersistence {
 
   private async ensureDir(): Promise<void> {
     await fs.mkdir(this.root, { recursive: true });
+  }
+
+  private password(): string | undefined {
+    return readVaultEncryptionSettings(process.env, this.vaultPolicy).password;
+  }
+
+  // Seals the named string fields of a record when a password is set.
+  private async sealFields<T extends object>(record: T, file: string, fields: readonly string[]): Promise<T> {
+    const password = this.password();
+    if (password === undefined) return record;
+    const copy: Record<string, unknown> = { ...(record as Record<string, unknown>) };
+    for (const field of fields) {
+      const value = copy[field];
+      if (typeof value === 'string' && value.length > 0) {
+        copy[field] = await sealVaultSecret(value, `${file}/${field}`, password);
+      }
+    }
+    return copy as T;
+  }
+
+  // Opens the named fields that are sealed; plaintext fields are left as they are.
+  private async openFields<T extends object>(
+    record: T | undefined,
+    file: string,
+    fields: readonly string[]
+  ): Promise<T | undefined> {
+    if (!record) return record;
+    const copy: Record<string, unknown> = { ...(record as Record<string, unknown>) };
+    for (const field of fields) {
+      if (!isVaultSecretJwe(copy[field])) continue;
+      copy[field] = await openVaultSecret(copy[field] as string, `${file}/${field}`, this.requirePassword());
+    }
+    return copy as T;
+  }
+
+  private async sealValue(value: string, kid: string): Promise<string> {
+    const password = this.password();
+    return password === undefined ? value : await sealVaultSecret(value, kid, password);
+  }
+
+  private async openValue(value: string | undefined, kid: string): Promise<string | undefined> {
+    return isVaultSecretJwe(value) ? await openVaultSecret(value, kid, this.requirePassword()) : value;
+  }
+
+  private requirePassword(): string {
+    const password = this.password();
+    if (password === undefined) {
+      throw new VaultEncryptionError(
+        'password_missing',
+        `${this.root} holds encrypted values; set ${VAULT_PASSWORD_ENV} to use it.`
+      );
+    }
+    return password;
   }
 
   private async reconcileServerUrl(): Promise<void> {
@@ -141,7 +204,10 @@ export class DirectoryPersistence implements OAuthPersistence {
   }
 
   private async readTokensAfterReconcile(): Promise<OAuthTokens | undefined> {
-    const tokens = await this.readJsonOrUndefined<OAuthTokens>(this.tokenPath);
+    const tokens = await this.openFields(await this.readJsonOrUndefined<OAuthTokens>(this.tokenPath), 'tokens.json', [
+      'access_token',
+      'refresh_token',
+    ]);
     return isStoredOAuthTokens(tokens) ? withHiddenOAuthTokenGeneration(tokens) : undefined;
   }
 
@@ -151,7 +217,10 @@ export class DirectoryPersistence implements OAuthPersistence {
     // Locked so clearRejectedCredentials cannot compare-then-unlink across a
     // concurrent write.
     await withFileLock(this.tokenPath, async () => {
-      await writeJsonFile(this.tokenPath, prepareStoredTokens(tokens));
+      await writeJsonFile(
+        this.tokenPath,
+        await this.sealFields(prepareStoredTokens(tokens), 'tokens.json', ['access_token', 'refresh_token'])
+      );
     });
     this.logger?.debug?.(`Saved tokens to ${this.tokenPath}`);
   }
@@ -193,7 +262,11 @@ export class DirectoryPersistence implements OAuthPersistence {
   }
 
   private async readClientInfoAfterReconcile(): Promise<OAuthClientInformationMixed | undefined> {
-    const info = await this.readJsonOrUndefined<OAuthClientInformationMixed>(this.clientInfoPath);
+    const info = await this.openFields(
+      await this.readJsonOrUndefined<OAuthClientInformationMixed>(this.clientInfoPath),
+      'client.json',
+      ['client_secret']
+    );
     return isStoredOAuthClientInformation(info) ? withHiddenOAuthClientGeneration(info) : undefined;
   }
 
@@ -201,7 +274,10 @@ export class DirectoryPersistence implements OAuthPersistence {
     await this.reconcileServerUrl();
     await this.ensureDir();
     await withFileLock(this.tokenPath, async () => {
-      await writeJsonFile(this.clientInfoPath, withOAuthClientGeneration(info));
+      await writeJsonFile(
+        this.clientInfoPath,
+        await this.sealFields(withOAuthClientGeneration(info), 'client.json', ['client_secret'])
+      );
     });
   }
 
@@ -212,7 +288,7 @@ export class DirectoryPersistence implements OAuthPersistence {
 
   private async readCodeVerifierAfterReconcile(): Promise<string | undefined> {
     try {
-      return (await fs.readFile(this.codeVerifierPath, 'utf8')).trim();
+      return await this.openValue((await fs.readFile(this.codeVerifierPath, 'utf8')).trim(), 'code_verifier.txt');
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
         return undefined;
@@ -224,7 +300,7 @@ export class DirectoryPersistence implements OAuthPersistence {
   async saveCodeVerifier(value: string): Promise<void> {
     await this.reconcileServerUrl();
     await this.ensureDir();
-    await writeTextFileAtomic(this.codeVerifierPath, value);
+    await writeTextFileAtomic(this.codeVerifierPath, await this.sealValue(value, 'code_verifier.txt'));
   }
 
   async readState(): Promise<string | undefined> {
@@ -237,7 +313,7 @@ export class DirectoryPersistence implements OAuthPersistence {
     // flow closed. Returning undefined here would skip the CSRF state check on
     // the authorization callback (see oauth.ts), so only the credential caches
     // (tokens/client) degrade to re-auth.
-    return readJsonFile<string>(this.statePath);
+    return await this.openValue(await readJsonFile<string>(this.statePath), 'state.txt');
   }
 
   // A present-but-corrupt credential cache (tokens/client) means "no usable
@@ -260,7 +336,7 @@ export class DirectoryPersistence implements OAuthPersistence {
   async saveState(value: string): Promise<void> {
     await this.reconcileServerUrl();
     await this.ensureDir();
-    await writeJsonFile(this.statePath, value);
+    await writeJsonFile(this.statePath, await this.sealValue(value, 'state.txt'));
   }
 
   async readDiscoveryState(): Promise<OAuthDiscoveryState | undefined> {
@@ -658,13 +734,15 @@ export async function createOAuthPersistenceStores(
   const serverUrl = definition.command.kind === 'http' ? definition.command.url.toString() : undefined;
 
   if (definition.tokenCacheDir) {
-    stores.unshift(new DirectoryPersistence(definition.tokenCacheDir, logger, serverUrl));
+    stores.unshift(
+      new DirectoryPersistence(definition.tokenCacheDir, logger, serverUrl, false, definition.oauthVaultEncryption)
+    );
   }
 
   // Migrate legacy default per-server cache (~/.mcporter/<name>) into the vault if present.
   const legacyDir = path.join(path.join(runtimeHome(), '.mcporter'), definition.name);
   if (!definition.tokenCacheDir) {
-    const legacy = new DirectoryPersistence(legacyDir, logger, serverUrl, true);
+    const legacy = new DirectoryPersistence(legacyDir, logger, serverUrl, true, definition.oauthVaultEncryption);
     const snapshot = await legacy.readSnapshot();
     if (
       snapshot.tokens ||
@@ -697,6 +775,8 @@ export async function createOAuthPersistenceStores(
         await vault.saveResourceUrl(snapshot.resourceUrl);
       }
       logger?.info?.(`Migrated legacy OAuth cache for '${definition.name}' into vault.`);
+      // Moved, not copied: the plaintext legacy files are removed once they are in the vault.
+      await legacy.clear('all');
     }
   }
 

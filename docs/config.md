@@ -49,7 +49,7 @@ mcporter honors XDG Base Directory env vars for its own paths when they are expl
 | Kind   | Env var           | mcporter path                                   | Legacy fallback      |
 | ------ | ----------------- | ----------------------------------------------- | -------------------- |
 | config | `XDG_CONFIG_HOME` | `$XDG_CONFIG_HOME/mcporter/mcporter.json[c]`    | `~/.mcporter/...`    |
-| data   | `XDG_DATA_HOME`   | `$XDG_DATA_HOME/mcporter/credentials.json`      | `~/.mcporter/...`    |
+| data   | `XDG_DATA_HOME`   | `$XDG_DATA_HOME/mcporter/credentials.json`      | `~/.mcporter/...`    | — see [Vault Encryption](#vault-encryption) |
 | cache  | `XDG_CACHE_HOME`  | `$XDG_CACHE_HOME/mcporter/<server>/schema.json` | `~/.mcporter/...`    |
 | state  | `XDG_STATE_HOME`  | `$XDG_STATE_HOME/mcporter/...`                  | `~/.mcporter/daemon` |
 
@@ -206,10 +206,11 @@ The schema is auto-generated from the Zod validation schemas using `pnpm generat
 
 Top-level structure:
 
-| Key          | Type     | Description                                                                                                            |
-| ------------ | -------- | ---------------------------------------------------------------------------------------------------------------------- |
-| `mcpServers` | object   | Map of server names → definitions. Required even if empty.                                                             |
-| `imports`    | string[] | Optional list of import kinds. Empty array disables imports entirely; omitting the key falls back to the default list. |
+| Key                    | Type     | Description                                                                                                                  |
+| ---------------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `mcpServers`           | object   | Map of server names → definitions. Required even if empty.                                                                   |
+| `imports`              | string[] | Optional list of import kinds. Empty array disables imports entirely; omitting the key falls back to the default list.       |
+| `oauthVaultEncryption` | string   | `"optional"` (default) or `"required"`; see [Vault Encryption](#vault-encryption). `MCPORTER_VAULT_ENCRYPTION` overrides it. |
 
 Server definition fields (subset of what `RawEntrySchema` accepts):
 
@@ -288,6 +289,17 @@ For keep-alive stdio servers, refresh happens before process start. If that proc
 
 - Machine-specific additions can live in `~/.mcporter/local.json` or `$XDG_CONFIG_HOME/mcporter/local.json`; point `mcporter config --config ~/.mcporter/local.json add ...` there when you prefer not to touch the repo. Since the runtime only watches one config at a time, CI jobs should always pass `--config config/mcporter.json` (or run from the repo root) for deterministic behavior.
 - OAuth tokens, cached server metadata, and generated CLIs should remain outside the repo (`~/.mcporter/...` or the matching `XDG_*_HOME/mcporter/...`, plus `dist/`).
+
+## Vault Encryption
+
+The OAuth vault (`credentials.json`, see the XDG table above) is plaintext JSON by default. Set `MCPORTER_VAULT_PASSWORD` (at least 16 characters; `openssl rand -base64 32`) to store each secret value in it (`access_token`, `refresh_token`, `client_secret`, the PKCE verifier and OAuth state) as an RFC 7516 JWE compact string in place: `PBES2-HS512+A256KW`, `A256GCM`, 8192 PBKDF2 iterations. The file keeps its shape; server names, URLs, client IDs and timestamps stay readable, and any JOSE library can decrypt a value with the password (`jose` for Node needs `PBES2-HS512+A256KW` in `keyManagementAlgorithms`).
+
+- Existing plaintext values are read as before and encrypted the next time a login is added or renewed (a token refresh, `mcporter auth`, `mcporter vault set`); until then they stay plain. `mcporter config doctor` shows how many values are still plain.
+- Sealed values with the password unset fail with a clear error and are never modified.
+- There is no password rotation: with a new password the stored values no longer open; run `mcporter vault clear <server>` and log in again. Restart `mcporter daemon` after changing these variables.
+- `oauthVaultEncryption: "required"` in `mcporter.json` (or `MCPORTER_VAULT_ENCRYPTION=required`, which overrides the config key) refuses every vault operation while the password is unset, so a cleared environment cannot write plaintext values. Default `optional`.
+- Tokens saved by older versions under `~/.mcporter/<server>/` are moved into the vault the first time the server is used and the old files are removed.
+- Servers with a `tokenCacheDir` get the same treatment: the secret values in `tokens.json`, `client.json`, `code_verifier.txt` and `state.txt` are encrypted; the other files there are not secrets.
 
 ## Validation & Troubleshooting
 

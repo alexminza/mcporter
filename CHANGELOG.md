@@ -2,6 +2,8 @@
 
 ## [0.14.3] - Unreleased
 
+- Encrypt the OAuth vault's secret values at rest as JWE compact strings (`PBES2-HS512+A256KW` / `A256GCM`), in place in `credentials.json` and in any `tokenCacheDir`, when `MCPORTER_VAULT_PASSWORD` is set; existing values are sealed on the next write and the file format is unchanged. `oauthVaultEncryption: "required"` (or `MCPORTER_VAULT_ENCRYPTION=required`) refuses plaintext. Sealed values without the password fail closed and are never rewritten. `config doctor` reports sealed and plaintext counts. Declares the `jose` dependency the MCP client already pulls in. (Issue #408)
+
 ## [0.14.2] - 2026-09-30
 
 **Highlights:** npm installs retain OAuth refresh protection, Windows daemon startup tolerates transient process-query failures, and long help flags remain readable.

@@ -9,11 +9,20 @@ import { readJsonFile } from '../src/fs-json.js';
 import { buildOAuthPersistence, clearOAuthCaches, readCachedAccessToken } from '../src/oauth-persistence.js';
 import { withRefreshLock } from '../src/oauth-refresh-lock.js';
 import { clearVaultEntry, loadVaultEntry, saveVaultEntry, vaultKeyForDefinition } from '../src/oauth-vault.js';
+import { getOAuthVaultPath } from '../src/oauth-vault.js';
+import { isVaultSecretJwe, openVaultSecret, sealVaultSecret, vaultSecretKid } from '../src/oauth-vault-encryption.js';
 
 const authMocks = vi.hoisted(() => ({
   discoverOAuthServerInfo: vi.fn(),
   refreshAuthorization: vi.fn(),
 }));
+
+const codecMocks = vi.hoisted(() => ({ sealVaultSecret: vi.fn() }));
+vi.mock('../src/oauth-vault-encryption.js', async (importOriginal) => {
+  const original = await importOriginal<typeof import('../src/oauth-vault-encryption.js')>();
+  codecMocks.sealVaultSecret.mockImplementation(original.sealVaultSecret);
+  return { ...original, sealVaultSecret: codecMocks.sealVaultSecret };
+});
 
 vi.mock('@modelcontextprotocol/client', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@modelcontextprotocol/client')>()),
@@ -1108,8 +1117,9 @@ describe('oauth persistence', () => {
     );
 
     await expect(readCachedAccessToken(definition)).resolves.toBeUndefined();
+    // Legacy files are moved into the vault, not copied (spec § "Design", Scope).
     await expect(readJsonFile(path.join(legacyDir, 'tokens.json'))).resolves.toBeUndefined();
-    await expect(readJsonFile(path.join(legacyDir, 'client.json'))).resolves.toEqual({ client_id: 'client-123' });
+    await expect(readJsonFile(path.join(legacyDir, 'client.json'))).resolves.toBeUndefined();
 
     authMocks.refreshAuthorization.mockClear();
     await expect(readCachedAccessToken(definition)).resolves.toBeUndefined();
@@ -2411,5 +2421,262 @@ describe('oauth persistence', () => {
       const request = fetchMock.mock.calls[0]?.[1] as { body?: URLSearchParams } | undefined;
       expect(request?.body?.toString()).toContain('refresh_token=winner-refresh');
     });
+  });
+});
+
+const vaultPlainEntry = (d: ServerDefinition) => ({
+  serverName: d.name,
+  serverUrl: 'https://example.com/mcp',
+  tokens: { access_token: 'access-enc', refresh_token: 'refresh-enc', token_type: 'Bearer' },
+  clientInfo: {
+    client_id: 'client-enc',
+    client_secret: 'secret-enc',
+    token_endpoint_auth_method: 'client_secret_post',
+  },
+  updatedAt: new Date().toISOString(),
+});
+const vaultSealedEntry = async (d: ServerDefinition, password: string) => {
+  const key = vaultKeyForDefinition(d);
+  const e = vaultPlainEntry(d);
+  const seal = (p: readonly string[], v: string) => sealVaultSecret(v, vaultSecretKid(key, p), password);
+  return {
+    ...e,
+    tokens: {
+      ...e.tokens,
+      access_token: await seal(['tokens', 'access_token'], 'access-enc'),
+      refresh_token: await seal(['tokens', 'refresh_token'], 'refresh-enc'),
+    },
+    clientInfo: { ...e.clientInfo, client_secret: await seal(['clientInfo', 'client_secret'], 'secret-enc') },
+  };
+};
+
+describe('vault encryption at rest', () => {
+  const PASSWORD = 'vault-password-for-tests-0123456789';
+  let dir: string;
+  let vaultPath: string;
+
+  // The suite above replaces process.env with a plain object, which neither
+  // the env stubbing restore nor os.homedir() follow; set and clear keys directly.
+  let savedDataHome: string | undefined;
+  beforeEach(async () => {
+    dir = await fs.mkdtemp(path.join(os.tmpdir(), 'mcporter-vault-enc-'));
+    savedDataHome = process.env.XDG_DATA_HOME;
+    process.env.XDG_DATA_HOME = path.join(dir, 'data');
+    delete process.env.MCPORTER_VAULT_PASSWORD;
+    delete process.env.MCPORTER_VAULT_ENCRYPTION;
+    vaultPath = getOAuthVaultPath();
+  });
+  afterEach(async () => {
+    delete process.env.MCPORTER_VAULT_PASSWORD;
+    delete process.env.MCPORTER_VAULT_ENCRYPTION;
+    if (savedDataHome === undefined) delete process.env.XDG_DATA_HOME;
+    else process.env.XDG_DATA_HOME = savedDataHome;
+    vi.restoreAllMocks();
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+
+  const seed = async (entries: Record<string, unknown>) => {
+    await fs.mkdir(path.dirname(vaultPath), { recursive: true });
+    await fs.writeFile(vaultPath, JSON.stringify({ version: 2, entries }), 'utf8');
+  };
+  type StoredEntry = { serverName: string; tokens: Record<string, unknown>; clientInfo: Record<string, unknown> };
+  const stored = async () =>
+    (await readJsonFile<{ version: number; entries: Record<string, StoredEntry> }>(vaultPath))!;
+
+  it('opens sealed values and keeps metadata', async () => {
+    const d = mkDef('enc-read');
+    await seed({ [vaultKeyForDefinition(d)]: await vaultSealedEntry(d, PASSWORD) });
+    process.env.MCPORTER_VAULT_PASSWORD = PASSWORD;
+    await expect(loadVaultEntry(d)).resolves.toMatchObject({
+      serverUrl: 'https://example.com/mcp',
+      tokens: { access_token: 'access-enc', refresh_token: 'refresh-enc', token_type: 'Bearer' },
+      clientInfo: { client_id: 'client-enc', client_secret: 'secret-enc' },
+    });
+  });
+
+  it.each([
+    ['unset', undefined, 'password_missing'],
+    ['wrong', 'another-vault-password-9876543210', 'decrypt_failed'],
+  ])('fails closed with the password %s and leaves the file untouched', async (_label, password, code) => {
+    const d = mkDef('enc-fail');
+    await seed({ [vaultKeyForDefinition(d)]: await vaultSealedEntry(d, PASSWORD) });
+    const before = await fs.readFile(vaultPath, 'utf8');
+    if (password) process.env.MCPORTER_VAULT_PASSWORD = password;
+    await expect(loadVaultEntry(d)).rejects.toMatchObject({ name: 'VaultEncryptionError', code });
+    await expect(clearVaultEntry(d, 'all')).rejects.toMatchObject({ code });
+    await expect(saveVaultEntry(d, { state: 'x' })).rejects.toMatchObject({ code });
+    expect(await fs.readFile(vaultPath, 'utf8')).toBe(before);
+  });
+
+  it('refuses a value moved to another entry', async () => {
+    const a = mkDef('enc-a');
+    const b = mkDef('enc-b');
+    const sa = await vaultSealedEntry(a, PASSWORD);
+    await seed({
+      [vaultKeyForDefinition(a)]: sa,
+      [vaultKeyForDefinition(b)]: { ...vaultPlainEntry(b), tokens: { ...sa.tokens } },
+    });
+    process.env.MCPORTER_VAULT_PASSWORD = PASSWORD;
+    await expect(loadVaultEntry(b)).rejects.toMatchObject({ code: 'payload_invalid' });
+  });
+
+  it('reads mixed sealed and plaintext values, and plaintext with a password set', async () => {
+    const d = mkDef('enc-mixed');
+    const key = vaultKeyForDefinition(d);
+    const e = vaultPlainEntry(d);
+    await seed({
+      [key]: {
+        ...e,
+        tokens: {
+          ...e.tokens,
+          refresh_token: await sealVaultSecret(
+            'refresh-enc',
+            vaultSecretKid(key, ['tokens', 'refresh_token']),
+            PASSWORD
+          ),
+        },
+      },
+    });
+    process.env.MCPORTER_VAULT_PASSWORD = PASSWORD;
+    await expect(loadVaultEntry(d)).resolves.toMatchObject({
+      tokens: { access_token: 'access-enc', refresh_token: 'refresh-enc' },
+    });
+  });
+
+  it('refuses every access under required without a password, from env or config', async () => {
+    process.env.MCPORTER_VAULT_ENCRYPTION = 'required';
+    await expect(loadVaultEntry(mkDef('req'))).rejects.toMatchObject({ code: 'password_missing' });
+    await expect(saveVaultEntry(mkDef('req'), { state: 'x' })).rejects.toMatchObject({ code: 'password_missing' });
+    delete process.env.MCPORTER_VAULT_ENCRYPTION;
+    const configured = { ...mkDef('req-config'), oauthVaultEncryption: 'required' as const };
+    await expect(loadVaultEntry(configured)).rejects.toMatchObject({ code: 'password_missing' });
+    await expect(saveVaultEntry(configured, { state: 'x' })).rejects.toMatchObject({ code: 'password_missing' });
+  });
+
+  it('seals the secret values and nothing else on write', async () => {
+    process.env.MCPORTER_VAULT_PASSWORD = PASSWORD;
+    const d = mkDef('enc-write');
+    const key = vaultKeyForDefinition(d);
+    await saveVaultEntry(d, {
+      tokens: { access_token: 'written', refresh_token: 'r', token_type: 'Bearer', expires_in: 3600 },
+      clientInfo: { client_id: 'cid', client_secret: 'cs', token_endpoint_auth_method: 'client_secret_post' },
+    });
+    const entry = (await stored()).entries[key]!;
+    expect(entry.serverName).toBe('enc-write');
+    expect(entry.tokens.token_type).toBe('Bearer');
+    expect(entry.tokens.expires_in).toBe(3600);
+    expect(entry.clientInfo.client_id).toBe('cid');
+    for (const [p, v] of [
+      [['tokens', 'access_token'], 'written'],
+      [['tokens', 'refresh_token'], 'r'],
+      [['clientInfo', 'client_secret'], 'cs'],
+    ] as const) {
+      const value = entry[p[0]]![p[1]] as string;
+      expect(isVaultSecretJwe(value), p.join('/')).toBe(true);
+      await expect(openVaultSecret(value, vaultSecretKid(key, p), PASSWORD)).resolves.toBe(v);
+    }
+  });
+
+  it('seals plaintext values on the next write', async () => {
+    const legacy = mkDef('legacy');
+    await seed({ [vaultKeyForDefinition(legacy)]: vaultPlainEntry(legacy) });
+    process.env.MCPORTER_VAULT_PASSWORD = PASSWORD;
+    await saveVaultEntry(mkDef('third'), { state: 'pending' });
+    const entry = (await stored()).entries[vaultKeyForDefinition(legacy)]!;
+    expect(isVaultSecretJwe(entry.tokens.refresh_token)).toBe(true);
+    expect(isVaultSecretJwe(entry.clientInfo.client_secret)).toBe(true);
+    await expect(loadVaultEntry(legacy)).resolves.toMatchObject({ tokens: { access_token: 'access-enc' } });
+  });
+
+  it('keeps writing plaintext without a password and skips missing fields with one', async () => {
+    const d = mkDef('plain-write');
+    await saveVaultEntry(d, { tokens: { access_token: 'plain', token_type: 'Bearer' } });
+    expect((await stored()).entries[vaultKeyForDefinition(d)]!.tokens.access_token).toBe('plain');
+    process.env.MCPORTER_VAULT_PASSWORD = PASSWORD;
+    await saveVaultEntry(d, { state: 'x' });
+    const entry = (await stored()).entries[vaultKeyForDefinition(d)]!;
+    expect(isVaultSecretJwe(entry.tokens.access_token)).toBe(true);
+    expect('refresh_token' in entry.tokens).toBe(false);
+    expect(entry.clientInfo).toBeUndefined();
+  });
+
+  it('seals a tokenCacheDir the same way', async () => {
+    process.env.MCPORTER_VAULT_PASSWORD = PASSWORD;
+    const cacheDir = path.join(dir, 'cache');
+    const d = mkDef('cached', cacheDir);
+    const persistence = await buildOAuthPersistence(d);
+    await persistence.saveTokens({ access_token: 'dir-access', refresh_token: 'dir-refresh', token_type: 'Bearer' });
+    await persistence.saveClientInfo({ client_id: 'dir-client', client_secret: 'dir-secret' });
+    const tokens = (await readJsonFile<{ access_token: string; refresh_token: string; token_type: string }>(
+      path.join(cacheDir, 'tokens.json')
+    ))!;
+    const client = (await readJsonFile<{ client_id: string; client_secret: string }>(
+      path.join(cacheDir, 'client.json')
+    ))!;
+    expect(tokens.token_type).toBe('Bearer');
+    expect(client.client_id).toBe('dir-client');
+    expect(isVaultSecretJwe(tokens.access_token)).toBe(true);
+    expect(isVaultSecretJwe(tokens.refresh_token)).toBe(true);
+    expect(isVaultSecretJwe(client.client_secret)).toBe(true);
+    await expect(openVaultSecret(tokens.refresh_token, 'tokens.json/refresh_token', PASSWORD)).resolves.toBe(
+      'dir-refresh'
+    );
+    await expect(persistence.readSnapshot()).resolves.toMatchObject({
+      tokens: { access_token: 'dir-access', refresh_token: 'dir-refresh' },
+      clientInfo: { client_secret: 'dir-secret' },
+    });
+  });
+
+  it('moves a legacy per-server cache into the vault and removes it', async () => {
+    const d = mkDef('legacy-dir');
+    const legacyDir = path.join(dir, '.mcporter', 'legacy-dir');
+    vi.spyOn(os, 'homedir').mockReturnValue(dir);
+    await fs.mkdir(legacyDir, { recursive: true });
+    await fs.writeFile(
+      path.join(legacyDir, 'tokens.json'),
+      JSON.stringify({ access_token: 'legacy-access', refresh_token: 'legacy-refresh', token_type: 'Bearer' }),
+      'utf8'
+    );
+    await buildOAuthPersistence(d);
+    await expect(loadVaultEntry(d)).resolves.toMatchObject({ tokens: { access_token: 'legacy-access' } });
+    await expect(fs.access(path.join(legacyDir, 'tokens.json'))).rejects.toThrow();
+  });
+
+  it('rejects a refresh whose vault write fails instead of returning the stale token', async () => {
+    const d = mkDef('refresh-write-fails');
+    const e = vaultPlainEntry(d);
+    // serverUrls is pre-populated so the URL reconciliation on read does not
+    // write; the first vault write is then the save after the refresh.
+    await fs.mkdir(path.dirname(vaultPath), { recursive: true });
+    await fs.writeFile(
+      vaultPath,
+      JSON.stringify({
+        version: 2,
+        entries: {
+          [vaultKeyForDefinition(d)]: { ...e, tokens: { ...e.tokens, expires_at: Math.floor(Date.now() / 1000) - 30 } },
+        },
+        serverUrls: { [d.name]: 'https://example.com/mcp' },
+      }),
+      'utf8'
+    );
+    process.env.MCPORTER_VAULT_PASSWORD = PASSWORD;
+    authMocks.discoverOAuthServerInfo.mockResolvedValue({ authorizationServerUrl: 'https://auth.example.com' });
+    authMocks.refreshAuthorization.mockResolvedValue({
+      access_token: 'fresh-access',
+      refresh_token: 'fresh-refresh',
+      token_type: 'Bearer',
+      expires_in: 3600,
+    });
+    const { VaultEncryptionError } = await import('../src/oauth-vault-encryption.js');
+    codecMocks.sealVaultSecret.mockRejectedValueOnce(new VaultEncryptionError('payload_invalid', 'self-check failed'));
+    await expect(readCachedAccessToken(d)).rejects.toMatchObject({ code: 'payload_invalid' });
+  });
+
+  it('repairs a corrupt vault as today when the password is set', async () => {
+    await fs.mkdir(path.dirname(vaultPath), { recursive: true });
+    await fs.writeFile(vaultPath, '{"version":1,"entries": { bad', 'utf8');
+    process.env.MCPORTER_VAULT_PASSWORD = PASSWORD;
+    await clearVaultEntry(mkDef('missing'), 'all');
+    expect(await readJsonFile(vaultPath)).toEqual({ version: 2, entries: {} });
   });
 });
