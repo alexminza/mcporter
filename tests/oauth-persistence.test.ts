@@ -11,6 +11,7 @@ import { withRefreshLock } from '../src/oauth-refresh-lock.js';
 import { clearVaultEntry, loadVaultEntry, saveVaultEntry, vaultKeyForDefinition } from '../src/oauth-vault.js';
 import { getOAuthVaultPath } from '../src/oauth-vault.js';
 import { isVaultSecretJwe, openVaultSecret, sealVaultSecret, vaultSecretKid } from '../src/oauth-vault-encryption.js';
+import { DirectoryPersistence } from '../src/oauth-persistence-stores.js';
 
 const authMocks = vi.hoisted(() => ({
   discoverOAuthServerInfo: vi.fn(),
@@ -2494,18 +2495,46 @@ describe('vault encryption at rest', () => {
     });
   });
 
-  it.each([
-    ['unset', undefined, 'password_missing'],
-    ['wrong', 'another-vault-password-9876543210', 'decrypt_failed'],
-  ])('fails closed with the password %s and leaves the file untouched', async (_label, password, code) => {
+  it('fails closed with the password unset and leaves the file untouched', async () => {
     const d = mkDef('enc-fail');
     await seed({ [vaultKeyForDefinition(d)]: await vaultSealedEntry(d, PASSWORD) });
     const before = await fs.readFile(vaultPath, 'utf8');
-    if (password) process.env.MCPORTER_VAULT_PASSWORD = password;
-    await expect(loadVaultEntry(d)).rejects.toMatchObject({ name: 'VaultEncryptionError', code });
-    await expect(clearVaultEntry(d, 'all')).rejects.toMatchObject({ code });
-    await expect(saveVaultEntry(d, { state: 'x' })).rejects.toMatchObject({ code });
+    await expect(loadVaultEntry(d)).rejects.toMatchObject({ name: 'VaultEncryptionError', code: 'password_missing' });
+    await expect(clearVaultEntry(d, 'all')).rejects.toMatchObject({ code: 'password_missing' });
+    await expect(saveVaultEntry(d, { state: 'x' })).rejects.toMatchObject({ code: 'password_missing' });
     expect(await fs.readFile(vaultPath, 'utf8')).toBe(before);
+  });
+
+  it('fails closed on a wrong password for reads and saves, but clear still removes the entry', async () => {
+    const d = mkDef('enc-wrong');
+    await seed({ [vaultKeyForDefinition(d)]: await vaultSealedEntry(d, PASSWORD) });
+    const before = await fs.readFile(vaultPath, 'utf8');
+    process.env.MCPORTER_VAULT_PASSWORD = 'another-vault-password-9876543210';
+    await expect(loadVaultEntry(d)).rejects.toMatchObject({ code: 'decrypt_failed' });
+    await expect(saveVaultEntry(d, { state: 'x' })).rejects.toMatchObject({ code: 'decrypt_failed' });
+    expect(await fs.readFile(vaultPath, 'utf8')).toBe(before);
+    // The documented recovery after a password change: clear needs no decryption.
+    await clearVaultEntry(d, 'all');
+    await expect(loadVaultEntry(d)).resolves.toBeUndefined();
+  });
+
+  it('isolates entries: a value sealed under another password does not block other servers', async () => {
+    const a = mkDef('enc-other-password');
+    const b = mkDef('enc-current-password');
+    await seed({
+      [vaultKeyForDefinition(a)]: await vaultSealedEntry(a, 'another-vault-password-9876543210'),
+      [vaultKeyForDefinition(b)]: await vaultSealedEntry(b, PASSWORD),
+    });
+    process.env.MCPORTER_VAULT_PASSWORD = PASSWORD;
+    await expect(loadVaultEntry(b)).resolves.toMatchObject({ tokens: { access_token: 'access-enc' } });
+    await expect(loadVaultEntry(a)).rejects.toMatchObject({ code: 'decrypt_failed' });
+    const sealedA = (await stored()).entries[vaultKeyForDefinition(a)]!.tokens.refresh_token;
+    await saveVaultEntry(b, { state: 'updated' });
+    // Untouched sealed values are written back byte-identical, not re-sealed.
+    expect((await stored()).entries[vaultKeyForDefinition(a)]!.tokens.refresh_token).toBe(sealedA);
+    await clearVaultEntry(a, 'all');
+    await expect(loadVaultEntry(a)).resolves.toBeUndefined();
+    await expect(loadVaultEntry(b)).resolves.toMatchObject({ state: 'updated' });
   });
 
   it('refuses a value moved to another entry', async () => {
@@ -2625,6 +2654,19 @@ describe('vault encryption at rest', () => {
       tokens: { access_token: 'dir-access', refresh_token: 'dir-refresh' },
       clientInfo: { client_secret: 'dir-secret' },
     });
+  });
+
+  it('clears rejected credentials in a tokenCacheDir when the password is set', async () => {
+    process.env.MCPORTER_VAULT_PASSWORD = PASSWORD;
+    const cacheDir = path.join(dir, 'cache-clear');
+    const store = new DirectoryPersistence(cacheDir, undefined, 'https://example.com/mcp');
+    await store.saveTokens({ access_token: 'dir-access', refresh_token: 'dir-refresh', token_type: 'Bearer' });
+    await store.saveClientInfo({ client_id: 'dir-client', client_secret: 'dir-secret' });
+    const tokens = await store.readTokens();
+    const info = await store.readClientInfo();
+    await store.clearRejectedCredentials(tokens, info);
+    await expect(fs.access(path.join(cacheDir, 'tokens.json'))).rejects.toThrow();
+    await expect(fs.access(path.join(cacheDir, 'client.json'))).rejects.toThrow();
   });
 
   it('moves a legacy per-server cache into the vault and removes it', async () => {

@@ -69,7 +69,15 @@ export function getOAuthVaultPath(): string {
   return path.join(runtimeStateDir('data'), 'credentials.json');
 }
 
-async function readVaultState(definition: ServerDefinition): Promise<VaultReadState> {
+// Which entries' sealed values a read needs opened: the definition's own
+// credentials (its key plus same-URL legacy rename candidates), or none for
+// operations that only delete or reconcile metadata.
+type VaultOpenScope = 'credentials' | 'none';
+
+async function readVaultState(
+  definition: ServerDefinition,
+  scope: VaultOpenScope = 'credentials'
+): Promise<VaultReadState> {
   // Throws under a `required` policy without a password, even when no vault
   // file exists yet: the policy is about this process, not the file.
   readVaultEncryptionSettings(process.env, definition.oauthVaultEncryption);
@@ -82,7 +90,7 @@ async function readVaultState(definition: ServerDefinition): Promise<VaultReadSt
       typeof existing.entries === 'object'
     ) {
       const vault = { ...existing, version: 2 } as VaultFile;
-      await openVaultSecrets(vault, definition);
+      await openVaultSecrets(vault, definition, scope);
       return { vault, needsRepair: existing.version !== 2 };
     }
     if (existing !== undefined) {
@@ -97,8 +105,8 @@ async function readVaultState(definition: ServerDefinition): Promise<VaultReadSt
   return { vault: emptyVault(), needsRepair: false };
 }
 
-async function readVault(definition: ServerDefinition): Promise<VaultFile> {
-  return (await readVaultState(definition)).vault;
+async function readVault(definition: ServerDefinition, scope: VaultOpenScope = 'credentials'): Promise<VaultFile> {
+  return (await readVaultState(definition, scope)).vault;
 }
 
 function emptyVault(): VaultFile {
@@ -119,22 +127,34 @@ function writePath(node: Record<string, unknown>, fieldPath: readonly string[], 
   current[fieldPath.at(-1) as string] = value;
 }
 
-// Opens every sealed value in place. Plaintext values and metadata are untouched;
-// a sealed value without a password, with the wrong one, or with another entry's
-// kid is a typed error, never a reset.
-async function openVaultSecrets(vault: VaultFile, definition: ServerDefinition): Promise<void> {
+// Opens the sealed values the caller needs, in place. Other entries keep their
+// ciphertext and are written back unchanged, so one value sealed under another
+// password cannot block every server. Without a password, any sealed value
+// anywhere is a typed error before any decryption; never a reset.
+async function openVaultSecrets(vault: VaultFile, definition: ServerDefinition, scope: VaultOpenScope): Promise<void> {
   const settings = readVaultEncryptionSettings(process.env, definition.oauthVaultEncryption);
-  for (const [key, entry] of Object.entries(vault.entries)) {
-    if (!isVaultEntry(entry)) continue;
-    for (const fieldPath of VAULT_SECRET_FIELDS) {
-      const value = readPath(entry, fieldPath);
-      if (!isVaultSecretJwe(value)) continue;
-      if (settings.password === undefined) {
+  if (settings.password === undefined) {
+    for (const entry of Object.values(vault.entries)) {
+      if (
+        isVaultEntry(entry) &&
+        VAULT_SECRET_FIELDS.some((fieldPath) => isVaultSecretJwe(readPath(entry, fieldPath)))
+      ) {
         throw new VaultEncryptionError(
           'password_missing',
           `The OAuth vault at ${getOAuthVaultPath()} holds encrypted values for '${entry.serverName}'; set ${VAULT_PASSWORD_ENV} to use it.`
         );
       }
+    }
+    return;
+  }
+  if (scope === 'none') return;
+  const exactKey = vaultKeyForDefinition(definition);
+  for (const key of new Set([exactKey, ...legacyOAuthRenameKeys(vault, definition, exactKey)])) {
+    const entry = vault.entries[key];
+    if (!isVaultEntry(entry)) continue;
+    for (const fieldPath of VAULT_SECRET_FIELDS) {
+      const value = readPath(entry, fieldPath);
+      if (!isVaultSecretJwe(value)) continue;
       writePath(
         entry as unknown as Record<string, unknown>,
         fieldPath,
@@ -144,8 +164,8 @@ async function openVaultSecrets(vault: VaultFile, definition: ServerDefinition):
   }
 }
 
-// Seals every secret string when a password is set. Values are plaintext in
-// memory after readVaultState, so nothing is sealed twice.
+// Seals every plaintext secret string when a password is set. Values that are
+// still sealed (entries the read did not open) pass through byte-identical.
 async function sealVaultSecrets(vault: VaultFile, password: string): Promise<VaultFile> {
   const out: VaultFile = { ...vault, entries: {} };
   for (const [key, entry] of Object.entries(vault.entries)) {
@@ -156,7 +176,7 @@ async function sealVaultSecrets(vault: VaultFile, password: string): Promise<Vau
     const copy = structuredClone(entry) as unknown as Record<string, unknown>;
     for (const fieldPath of VAULT_SECRET_FIELDS) {
       const value = readPath(copy, fieldPath);
-      if (typeof value === 'string' && value.length > 0) {
+      if (typeof value === 'string' && value.length > 0 && !isVaultSecretJwe(value)) {
         writePath(copy, fieldPath, await sealVaultSecret(value, vaultSecretKid(key, fieldPath), password));
       }
     }
@@ -187,7 +207,7 @@ export async function reconcileVaultServerUrl(definition: ServerDefinition): Pro
   }
   const serverUrl = definition.command.url.toString();
   await withFileLock(getOAuthVaultPath(), async () => {
-    const { vault, needsRepair } = await readVaultState(definition);
+    const { vault, needsRepair } = await readVaultState(definition, 'none');
     const serverUrls = stringRecord(vault.serverUrls);
     const previousUrl = serverUrls[definition.name];
     const namedEntryUrls = Object.values(vault.entries)
@@ -244,7 +264,7 @@ export async function vaultCredentialKeys(definition: ServerDefinition): Promise
   if (definition.command.kind !== 'http') {
     return [key];
   }
-  const vault = await readVault(definition);
+  const vault = await readVault(definition, 'none');
   return [...new Set([key, ...legacyOAuthRenameKeys(vault, definition, key)])];
 }
 
@@ -485,7 +505,9 @@ export async function clearVaultEntry(
 ): Promise<void> {
   const key = vaultKeyForDefinition(definition);
   await withFileLock(getOAuthVaultPath(), async () => {
-    const { vault, needsRepair } = await readVaultState(definition);
+    // Deleting needs no plaintext, so a value this password cannot open can
+    // still be cleared: the documented recovery after a password change.
+    const { vault, needsRepair } = await readVaultState(definition, 'none');
     const existing = isVaultEntry(vault.entries[key]) ? vault.entries[key] : undefined;
     const fallback = findSameUrlCredentials(vault, definition, key, existing);
     const inheritedKeys = scope === 'all' ? legacyOAuthRenameKeys(vault, definition, key) : fallback.sourceKeys;

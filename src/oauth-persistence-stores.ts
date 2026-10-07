@@ -232,13 +232,21 @@ export class DirectoryPersistence implements OAuthPersistence {
     await this.reconcileServerUrl();
     await withFileLock(this.tokenPath, async () => {
       if (expectedTokens) {
-        const current = await this.readJsonOrUndefined<OAuthTokens>(this.tokenPath);
+        const current = await this.openFields(
+          await this.readJsonOrUndefined<OAuthTokens>(this.tokenPath),
+          'tokens.json',
+          ['access_token', 'refresh_token']
+        );
         if (sameOAuthTokenGeneration(current, expectedTokens)) {
           await this.unlinkIfPresent(this.tokenPath);
         }
       }
       if (expectedClientInfo) {
-        const currentClientInfo = await this.readJsonOrUndefined<OAuthClientInformationMixed>(this.clientInfoPath);
+        const currentClientInfo = await this.openFields(
+          await this.readJsonOrUndefined<OAuthClientInformationMixed>(this.clientInfoPath),
+          'client.json',
+          ['client_secret']
+        );
         if (sameOAuthClientGeneration(currentClientInfo, expectedClientInfo)) {
           await this.unlinkIfPresent(this.clientInfoPath);
         }

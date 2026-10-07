@@ -297,7 +297,7 @@ The OAuth vault (`credentials.json`, see the XDG table above) is plaintext JSON 
 - Existing plaintext values are read as before and encrypted the next time a login is added or renewed (a token refresh, `mcporter auth`, `mcporter vault set`); until then they stay plain. `mcporter config doctor` shows how many values are still plain.
 - Sealed values with the password unset fail with a clear error and are never modified.
 - There is no password rotation: with a new password the stored values no longer open; run `mcporter vault clear <server>` and log in again. Restart `mcporter daemon` after changing these variables.
-- `oauthVaultEncryption: "required"` in `mcporter.json` (or `MCPORTER_VAULT_ENCRYPTION=required`, which overrides the config key) refuses every vault operation while the password is unset, so a cleared environment cannot write plaintext values. Default `optional`.
+- `oauthVaultEncryption: "required"` in `mcporter.json` (or `MCPORTER_VAULT_ENCRYPTION=required`, which overrides the config key) refuses every vault operation while the password is unset, so a cleared environment cannot write plaintext values. Default `optional`. The config key applies to servers defined in config; ad-hoc servers (`mcporter auth <url>`) follow `MCPORTER_VAULT_ENCRYPTION` only.
 - Tokens saved by older versions under `~/.mcporter/<server>/` are moved into the vault the first time the server is used and the old files are removed.
 - Servers with a `tokenCacheDir` get the same treatment: the secret values in `tokens.json`, `client.json`, `code_verifier.txt` and `state.txt` are encrypted; the other files there are not secrets.
 
