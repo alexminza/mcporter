@@ -2,6 +2,15 @@
 
 ## [0.14.3] - Unreleased
 
+- Refresh MCP client/server to 2.3.0, legacy SDK fixtures to 1.32.0, Rolldown, Vite, Vitest and Node types; retain OAuth token correlation, method-preserving same-origin redirects, Node 24 support and the 48-hour dependency cooldown.
+- Inspect generated Node/Bun script metadata on Windows through the declared interpreter, keeping native binaries directly executable.
+- Renew expired daemon views once only after a broker-confirmed rejection before dispatch, retaining configuration authority and preventing replay after replacement or shutdown. Thanks @mbac (#410).
+- Preserve typed request IDs during replay, named arguments after failed proxy discovery, and JSON null result entries. Thanks @rudycelekli (#411, #413, #420).
+- Decode compressed HTTP response streams and preserve session-termination DELETE across 301/302 redirects, including empty-body and streaming cancellation coverage. Thanks @rudycelekli (#416, #419).
+- Preserve JSONC config selection, config-relative working directories, and explicit lifecycle/logging policies in generated CLI artifacts; validate boolean flags and honor required schema defaults. Thanks @rudycelekli (#414, #415, #417, #418).
+- Emit valid TypeScript names for digit-leading servers and tools named `call`, `listTools`, or `new`; skip only `close`/`then` client methods with a warning while keeping unrelated methods and types-only output available. Thanks @rudycelekli (#422).
+- Preserve empty positional arguments after `--` and keep `Infinity`/`-Infinity` as strings instead of sending JSON null. Thanks @rudycelekli (#412, #421).
+- Print unknown-server errors from `config get` and `config logout` with one `[mcporter]` prefix. Thanks @KrasimirKralev (#409).
 - Encrypt the OAuth vault's secret values at rest as JWE compact strings (`PBES2-HS512+A256KW` / `A256GCM`), in place in `credentials.json` and in any `tokenCacheDir`, when `MCPORTER_VAULT_PASSWORD` is set; existing values are sealed on the next write and the file format is unchanged. `oauthVaultEncryption: "required"` (or `MCPORTER_VAULT_ENCRYPTION=required`) refuses plaintext in the vault and in `tokenCacheDir`. Sealed values without the password fail closed and are never rewritten or deleted, in the vault and in `tokenCacheDir`, and a plaintext `tokenCacheDir` cannot hide that refusal. Legacy `~/.mcporter/<server>/` caches are removed after migration only when the password is set. Generated CLIs embed the policy of the config they were generated from. Stdio servers (direct or daemon-managed) and the OAuth auth helper are started without the two vault variables. `config doctor` reports sealed and plaintext counts and flags a vault file that is not a vault document instead of crashing. Declares the `jose` dependency the MCP client already pulls in. (Issue #408)
 
 ## [0.14.2] - 2026-09-30

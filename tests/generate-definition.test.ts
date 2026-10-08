@@ -82,12 +82,24 @@ describe('resolveServerDefinition HTTP selectors', () => {
         mcpServers: { sealed: { command: 'https://sealed.example.com/mcp', auth: 'oauth' } },
       })
     );
+    const stdioConfigPath = path.join(tempDir, 'stdio.json');
+    await fs.writeFile(
+      stdioConfigPath,
+      JSON.stringify({
+        oauthVaultEncryption: 'required',
+        mcpServers: { local: { command: 'node', args: ['server.js'] } },
+      })
+    );
     try {
       const { definition } = await resolveServerDefinition(configPath);
       expect(definition.oauthVaultEncryption).toBe('required');
       // Regeneration passes the serialized definition back inline; the policy must survive that round trip.
       const { definition: again } = await resolveServerDefinition(JSON.stringify(serializeDefinition(definition)));
       expect(again.oauthVaultEncryption).toBe('required');
+      // Ordinary entries take the shared config normalization path; the policy applies there too.
+      const { definition: local } = await resolveServerDefinition(stdioConfigPath);
+      expect(local.command.kind).toBe('stdio');
+      expect(local.oauthVaultEncryption).toBe('required');
     } finally {
       await fs.rm(tempDir, { recursive: true, force: true });
     }

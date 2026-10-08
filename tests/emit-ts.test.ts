@@ -834,35 +834,44 @@ export async function run() {
   // Regeneration over a caller written against the 0.13.13 client, whose `.d.ts` declared
   // `search(query: string, ...)` and whose wrapper forwarded that one value to the proxy. The call
   // still reaches the runtime the same way, and the type error names the object to migrate to.
-  it('keeps a 0.13.13 positional call working at runtime and points tsc at the documented migration', async () => {
-    const { clientPath, clientSource, typesPath } = await emitChromeClient();
-    const runtime = createRecordingRuntime();
-    const client = await loadEmittedClient(clientSource, runtime);
+  it(
+    'keeps a 0.13.13 positional call working at runtime and points tsc at the documented migration',
+    async () => {
+      const { clientPath, clientSource, typesPath } = await emitChromeClient();
+      const runtime = createRecordingRuntime();
+      const client = await loadEmittedClient(clientSource, runtime);
 
-    // Transpile-only callers: the proxy maps a single positional value to the first schema
-    // property, as it did for the 0.13.13 wrapper, so nothing changes on the wire.
-    await client.search?.('positional');
-    expect(runtime.callTool).toHaveBeenCalledWith('chrome', 'search', {
-      args: { query: 'positional', limit: 10, verbose: false },
-    });
+      // Transpile-only callers: the proxy maps a single positional value to the first schema
+      // property, as it did for the 0.13.13 wrapper, so nothing changes on the wire.
+      await client.search?.('positional');
+      expect(runtime.callTool).toHaveBeenCalledWith('chrome', 'search', {
+        args: { query: 'positional', limit: 10, verbose: false },
+      });
 
-    const dir = path.dirname(clientPath);
-    const positionalCallerPath = path.join(dir, 'caller-0-13-13.ts');
-    const migratedCallerPath = path.join(dir, 'caller-migrated.ts');
-    await fs.writeFile(positionalCallerPath, searchCallerSource("client.search('positional')"), 'utf8');
-    await fs.writeFile(migratedCallerPath, searchCallerSource("client.search({ query: 'positional' })"), 'utf8');
+      const dir = path.dirname(clientPath);
+      const positionalCallerPath = path.join(dir, 'caller-0-13-13.ts');
+      const migratedCallerPath = path.join(dir, 'caller-migrated.ts');
+      await fs.writeFile(positionalCallerPath, searchCallerSource("client.search('positional')"), 'utf8');
+      await fs.writeFile(migratedCallerPath, searchCallerSource("client.search({ query: 'positional' })"), 'utf8');
 
-    const diagnostics = compileUnderRepositoryConfig([clientPath, typesPath, positionalCallerPath, migratedCallerPath]);
+      const diagnostics = compileUnderRepositoryConfig([
+        clientPath,
+        typesPath,
+        positionalCallerPath,
+        migratedCallerPath,
+      ]);
 
-    // Type-checked callers: one TS2345 per positional call site, naming the object parameter.
-    expect(diagnostics.filter((entry) => entry.file !== path.basename(positionalCallerPath))).toEqual([]);
-    const positional = diagnostics.filter((entry) => entry.file === path.basename(positionalCallerPath));
-    expect(positional).toHaveLength(1);
-    expect(positional[0]?.code).toBe(2345);
-    expect(positional[0]?.message).toContain(
-      "Argument of type 'string' is not assignable to parameter of type '{ query: string;"
-    );
-  });
+      // Type-checked callers: one TS2345 per positional call site, naming the object parameter.
+      expect(diagnostics.filter((entry) => entry.file !== path.basename(positionalCallerPath))).toEqual([]);
+      const positional = diagnostics.filter((entry) => entry.file === path.basename(positionalCallerPath));
+      expect(positional).toHaveLength(1);
+      expect(positional[0]?.code).toBe(2345);
+      expect(positional[0]?.message).toContain(
+        "Argument of type 'string' is not assignable to parameter of type '{ query: string;"
+      );
+    },
+    budget(30_000)
+  );
 });
 
 // A caller that makes one `search` call, spelled the 0.13.13 way or the documented way.
@@ -980,4 +989,92 @@ describe('emit-ts client against a stdio MCP server', () => {
     },
     budget(20_000)
   );
+});
+
+describe('emitted client member collisions', () => {
+  it('preserves unrelated client methods when close and then are advertised', async () => {
+    const tools = ['close', 'then', 'normal'].map((name) => ({
+      name,
+      inputSchema: { type: 'object', properties: { value: { type: 'string', default: 'default' } } },
+    }));
+    const runtime = createRuntimeStub(tools);
+    const callTool = vi.spyOn(runtime, 'callTool').mockResolvedValue({ content: [{ type: 'text', text: 'ok' }] });
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'emit-ts-reserved-members-'));
+    try {
+      const output = path.join(dir, 'client.ts');
+      const declarations = path.join(dir, 'client.d.ts');
+      await fs.writeFile(output, 'existing client');
+      await fs.writeFile(declarations, 'existing declarations');
+      await handleEmitTs(runtime, ['integration', '--out', output, '--mode', 'client']);
+      const source = await fs.readFile(output, 'utf8');
+      const types = await fs.readFile(declarations, 'utf8');
+      expect(types).toContain('normal(');
+      expect(types).not.toMatch(/\b(?:close|then)\(/);
+      expect(warning).toHaveBeenCalledWith(expect.stringContaining('Skipping client methods "close", "then"'));
+      expect(compileUnderRepositoryConfig([output, declarations])).toEqual([]);
+      const client = await loadEmittedClient(source, runtime, 'createIntegrationClient');
+      expect(client.then).toBeUndefined();
+      await client.normal?.();
+      expect(callTool).toHaveBeenCalledWith('integration', 'normal', { args: { value: 'default' } });
+      await client.close?.();
+      expect(callTool).toHaveBeenCalledTimes(1);
+
+      const typesOnly = path.join(dir, 'all-tools.d.ts');
+      await handleEmitTs(runtime, ['integration', '--out', typesOnly, '--mode', 'types']);
+      const allTypes = await fs.readFile(typesOnly, 'utf8');
+      expect(allTypes).toContain('close(');
+      expect(allTypes).toContain('then(');
+      expect(allTypes).toContain('normal(');
+    } finally {
+      warning.mockRestore();
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['call', 'listTools', 'new'])('routes tool %s through real proxy mapping with defaults', async (toolName) => {
+    const tool = {
+      name: toolName,
+      inputSchema: { type: 'object', properties: { value: { type: 'string', default: 'default' } } },
+    };
+    const docs = emitTsTestInternals.buildDocEntries('integration', [buildToolMetadata(tool)], true);
+    const source = renderClientModule({ interfaceName: 'IntegrationTools', docs, metadata: testMetadata });
+    const runtime = createRuntimeStub([tool]);
+    const callTool = vi.spyOn(runtime, 'callTool').mockResolvedValue({ content: [{ type: 'text', text: 'ok' }] });
+    const client = await loadEmittedClient(source, runtime, 'createIntegrationClient');
+    await client[toolName]?.();
+    expect(callTool).toHaveBeenCalledWith('integration', toolName, { args: { value: 'default' } });
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'emit-ts-tool-member-'));
+    try {
+      const file = path.join(dir, 'client.ts');
+      await fs.writeFile(file, source, 'utf8');
+      expect(compileUnderRepositoryConfig([file])).toEqual([]);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('emitted server identifier names', () => {
+  it('emits parseable declarations and clients for a digit-leading server name', async () => {
+    const definition = { ...integrationDefinition, name: '1password' };
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'emit-ts-server-name-'));
+    try {
+      const output = path.join(tmp, 'client.ts');
+      await handleEmitTs(createRuntimeStub([listCommentsTool], definition), [
+        '1password',
+        '--out',
+        output,
+        '--mode',
+        'client',
+      ]);
+      const source = await fs.readFile(output, 'utf8');
+      expect(source).toContain('export interface Server1passwordTools');
+      expect(source).toContain('createServer1passwordClient');
+      expect(source).toContain('createServerProxy(runtime, "1password")');
+      expect(compileUnderRepositoryConfig([output, path.join(tmp, 'client.d.ts')])).toEqual([]);
+    } finally {
+      await fs.rm(tmp, { recursive: true, force: true });
+    }
+  });
 });
