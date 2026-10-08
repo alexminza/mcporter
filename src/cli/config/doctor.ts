@@ -13,24 +13,40 @@ import { MCPORTER_VERSION } from '../../version.js';
 import { logConfigLocations, resolveConfigLocations } from './shared.js';
 import type { ConfigCliOptions } from './types.js';
 
+// Mirrors the vault reader's shape check; anything else is repaired on the next write.
+function isVaultDocument(document: unknown): document is { entries: Record<string, unknown> } {
+  if (!document || typeof document !== 'object') return false;
+  const { version, entries } = document as { version?: unknown; entries?: unknown };
+  return (version === 1 || version === 2) && !!entries && typeof entries === 'object';
+}
+
 async function reportVault(issues: string[], configuredPolicy: 'optional' | 'required' | undefined): Promise<void> {
   const vaultPath = getOAuthVaultPath();
   let stats: ReturnType<typeof describeVaultSecrets> | 'absent' | 'unreadable';
+  let problem: string | undefined;
   try {
-    const document = await readJsonFile<{ entries?: unknown }>(vaultPath);
-    stats = document === undefined ? 'absent' : describeVaultSecrets(document.entries);
+    const document = await readJsonFile(vaultPath);
+    if (document === undefined) {
+      stats = 'absent';
+    } else if (isVaultDocument(document)) {
+      stats = describeVaultSecrets(document.entries);
+    } else {
+      // Same shape check as the vault reader, which treats this as needing repair.
+      stats = 'unreadable';
+      problem =
+        'The OAuth vault is not a valid OAuth vault document; mcporter will rewrite it on the next credential write.';
+    }
   } catch (error) {
     if (!(error instanceof SyntaxError)) throw error;
     stats = 'unreadable';
+    problem = 'The OAuth vault is not valid JSON; mcporter will rewrite it on the next credential write.';
   }
   const label =
     typeof stats === 'string'
       ? stats
       : `${stats.entries} entries, ${stats.sealed} sealed values, ${stats.plaintext} plaintext values`;
   console.log(`OAuth vault: ${vaultPath} (${label})`);
-  if (stats === 'unreadable') {
-    issues.push('The OAuth vault is not valid JSON; mcporter will rewrite it on the next credential write.');
-  }
+  if (problem) issues.push(problem);
   try {
     const settings = readVaultEncryptionSettings(process.env, configuredPolicy);
     console.log(

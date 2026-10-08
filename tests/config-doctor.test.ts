@@ -127,6 +127,14 @@ describe('config doctor vault state', () => {
     expect(out).toContain('policy required');
     expect(out).toContain('under oauthVaultEncryption');
   });
+  it('reports a vault that is valid JSON but not a vault document as unreadable', async () => {
+    for (const body of ['null', '[]', '"text"', '{"version":2,"entries":7}']) {
+      await writeVaultFile(body);
+      const out = await runDoctor();
+      expect(out, body).toContain('(unreadable)');
+      expect(out, body).toContain('not a valid OAuth vault');
+    }
+  });
   it('reports unreadable vaults and settings errors as issues', async () => {
     await writeVaultFile('{"version":1,"entries": { bad');
     expect(await runDoctor()).toContain('(unreadable)');
