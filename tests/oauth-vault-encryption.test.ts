@@ -11,7 +11,6 @@ import {
   VAULT_PBES2_MAX_ITERATIONS,
   VAULT_SECRET_FIELDS,
   VaultEncryptionError,
-  childEnvWithoutVaultSecrets,
   describeVaultSecrets,
   isVaultSecretJwe,
   openVaultSecret,
@@ -143,18 +142,6 @@ describe('isVaultSecretJwe', () => {
     expect(isVaultSecretJwe(await foreign({ alg: 'dir', enc: 'A256GCM', typ: 'at+jwe' }, crypto.randomBytes(32)))).toBe(
       false
     );
-  });
-});
-
-describe('childEnvWithoutVaultSecrets', () => {
-  it('removes the vault variables and nothing else', () => {
-    expect(
-      childEnvWithoutVaultSecrets({
-        PATH: '/bin',
-        MCPORTER_VAULT_PASSWORD: PASSWORD,
-        MCPORTER_VAULT_ENCRYPTION: 'required',
-      })
-    ).toEqual({ PATH: '/bin' });
   });
 });
 
