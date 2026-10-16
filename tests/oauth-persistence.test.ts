@@ -2588,8 +2588,13 @@ describe('vault encryption at rest', () => {
     const d = mkDef('enc-write');
     const key = vaultKeyForDefinition(d);
     await saveVaultEntry(d, {
-      tokens: { access_token: 'written', refresh_token: 'r', token_type: 'Bearer', expires_in: 3600 },
-      clientInfo: { client_id: 'cid', client_secret: 'cs', token_endpoint_auth_method: 'client_secret_post' },
+      tokens: { access_token: 'written', refresh_token: 'r', id_token: 'idt', token_type: 'Bearer', expires_in: 3600 },
+      clientInfo: {
+        client_id: 'cid',
+        client_secret: 'cs',
+        registration_access_token: 'rat',
+        token_endpoint_auth_method: 'client_secret_post',
+      } as Parameters<typeof saveVaultEntry>[1]['clientInfo'],
     });
     const entry = (await stored()).entries[key]!;
     expect(entry.serverName).toBe('enc-write');
@@ -2599,7 +2604,9 @@ describe('vault encryption at rest', () => {
     for (const [p, v] of [
       [['tokens', 'access_token'], 'written'],
       [['tokens', 'refresh_token'], 'r'],
+      [['tokens', 'id_token'], 'idt'],
       [['clientInfo', 'client_secret'], 'cs'],
+      [['clientInfo', 'registration_access_token'], 'rat'],
     ] as const) {
       const value = entry[p[0]]![p[1]] as string;
       expect(isVaultSecretJwe(value), p.join('/')).toBe(true);
@@ -2635,19 +2642,33 @@ describe('vault encryption at rest', () => {
     const cacheDir = path.join(dir, 'cache');
     const d = mkDef('cached', cacheDir);
     const persistence = await buildOAuthPersistence(d);
-    await persistence.saveTokens({ access_token: 'dir-access', refresh_token: 'dir-refresh', token_type: 'Bearer' });
-    await persistence.saveClientInfo({ client_id: 'dir-client', client_secret: 'dir-secret' });
-    const tokens = (await readJsonFile<{ access_token: string; refresh_token: string; token_type: string }>(
-      path.join(cacheDir, 'tokens.json')
-    ))!;
-    const client = (await readJsonFile<{ client_id: string; client_secret: string }>(
+    await persistence.saveTokens({
+      access_token: 'dir-access',
+      refresh_token: 'dir-refresh',
+      id_token: 'dir-id',
+      token_type: 'Bearer',
+    });
+    await persistence.saveClientInfo({
+      client_id: 'dir-client',
+      client_secret: 'dir-secret',
+      registration_access_token: 'dir-rat',
+    } as Parameters<typeof persistence.saveClientInfo>[0]);
+    const tokens = (await readJsonFile<{
+      access_token: string;
+      refresh_token: string;
+      id_token: string;
+      token_type: string;
+    }>(path.join(cacheDir, 'tokens.json')))!;
+    const client = (await readJsonFile<{ client_id: string; client_secret: string; registration_access_token: string }>(
       path.join(cacheDir, 'client.json')
     ))!;
     expect(tokens.token_type).toBe('Bearer');
     expect(client.client_id).toBe('dir-client');
     expect(isVaultSecretJwe(tokens.access_token)).toBe(true);
     expect(isVaultSecretJwe(tokens.refresh_token)).toBe(true);
+    expect(isVaultSecretJwe(tokens.id_token)).toBe(true);
     expect(isVaultSecretJwe(client.client_secret)).toBe(true);
+    expect(isVaultSecretJwe(client.registration_access_token)).toBe(true);
     await expect(openVaultSecret(tokens.refresh_token, 'tokens.json/refresh_token', PASSWORD)).resolves.toBe(
       'dir-refresh'
     );

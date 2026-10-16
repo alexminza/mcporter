@@ -58,8 +58,8 @@ export function prepareStoredTokens(tokens: OAuthTokens): OAuthTokens {
   return withStoredExpiry(withOAuthTokenGeneration(tokens));
 }
 
-const TOKEN_SECRET_FIELDS = ['access_token', 'refresh_token'] as const;
-const CLIENT_SECRET_FIELDS = ['client_secret'] as const;
+const TOKEN_SECRET_FIELDS = ['access_token', 'refresh_token', 'id_token'] as const;
+const CLIENT_SECRET_FIELDS = ['client_secret', 'registration_access_token'] as const;
 
 export class DirectoryPersistence implements OAuthPersistence {
   private readonly tokenPath: string;

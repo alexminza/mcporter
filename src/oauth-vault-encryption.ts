@@ -15,10 +15,14 @@ export const VAULT_PBES2_ITERATIONS = 8192;
 export const VAULT_PBES2_MAX_ITERATIONS = 100_000;
 export const MIN_VAULT_PASSWORD_LENGTH = 16;
 // The only values ever sealed; a test checks this list against VaultEntry.
+// `id_token` carries identity claims in clear and secret scanners flag it;
+// `registration_access_token` is the RFC 7592 bearer secret for the client record.
 export const VAULT_SECRET_FIELDS: readonly (readonly string[])[] = [
   ['tokens', 'access_token'],
   ['tokens', 'refresh_token'],
+  ['tokens', 'id_token'],
   ['clientInfo', 'client_secret'],
+  ['clientInfo', 'registration_access_token'],
   ['codeVerifier'],
   ['state'],
 ];

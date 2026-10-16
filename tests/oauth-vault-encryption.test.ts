@@ -150,11 +150,19 @@ describe('VAULT_SECRET_FIELDS and describeVaultSecrets', () => {
     const entry: VaultEntry = {
       serverName: 'x',
       updatedAt: 'now',
-      tokens: { access_token: 'a', refresh_token: 'r', token_type: 'Bearer' },
-      clientInfo: { client_id: 'c', client_secret: 's' },
+      tokens: { access_token: 'a', refresh_token: 'r', id_token: 'i', token_type: 'Bearer' },
+      clientInfo: { client_id: 'c', client_secret: 's', registration_access_token: 'rat' } as VaultEntry['clientInfo'],
       codeVerifier: 'v',
       state: 's',
     };
+    // An OpenID Connect ID token carries identity claims and scanners flag it;
+    // an RFC 7592 registration access token is a bearer secret for the client record.
+    expect(VAULT_SECRET_FIELDS).toEqual(
+      expect.arrayContaining([
+        ['tokens', 'id_token'],
+        ['clientInfo', 'registration_access_token'],
+      ])
+    );
     for (const path of VAULT_SECRET_FIELDS) {
       expect(
         typeof path.reduce<unknown>((n, k) => (n as Record<string, unknown> | undefined)?.[k], entry),

@@ -296,7 +296,7 @@ For keep-alive stdio servers, refresh happens before process start. If that proc
 
 ## Vault Encryption
 
-The OAuth vault (`credentials.json`, see the XDG table above) is plaintext JSON by default. Set `MCPORTER_VAULT_PASSWORD` (at least 16 characters; `openssl rand -base64 32`) to store each secret value in it (`access_token`, `refresh_token`, `client_secret`, the PKCE verifier and OAuth state) as an RFC 7516 JWE compact string in place: `PBES2-HS512+A256KW`, `A256GCM`, 8192 PBKDF2 iterations. The file keeps its shape; server names, URLs, client IDs and timestamps stay readable, and any JOSE library can decrypt a value with the password (`jose` for Node needs `PBES2-HS512+A256KW` in `keyManagementAlgorithms`).
+The OAuth vault (`credentials.json`, see the XDG table above) is plaintext JSON by default. Set `MCPORTER_VAULT_PASSWORD` (at least 16 characters; `openssl rand -base64 32`) to store each secret value in it (`access_token`, `refresh_token`, `id_token`, `client_secret`, `registration_access_token`, the PKCE verifier and OAuth state) as an RFC 7516 JWE compact string in place: `PBES2-HS512+A256KW`, `A256GCM`, 8192 PBKDF2 iterations. The file keeps its shape; server names, URLs, client IDs and timestamps stay readable, and any JOSE library can decrypt a value with the password (`jose` for Node needs `PBES2-HS512+A256KW` in `keyManagementAlgorithms`).
 
 - Existing plaintext values are read as before and encrypted the next time a login is added or renewed (a token refresh, `mcporter auth`, `mcporter vault set`); until then they stay plain. `mcporter config doctor` shows how many values are still plain.
 - Sealed values with the password unset fail with a clear error and are never modified.
