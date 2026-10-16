@@ -15,6 +15,8 @@ Two new flag sets let you describe a server on the command line:
 - `mcporter list --http-url https://mcp.linear.app/mcp [--name linear]`
 - `mcporter call --stdio "bun run ./server.ts" --name local-tools`
 
+Value-taking ad-hoc flags also accept `--flag=value`, for example `--http-url=https://mcp.example.com/mcp` or `--stdio-arg=--port=3000`. Additional `=` characters stay in the value. Put literal tool arguments after `--` so they are not interpreted as ad-hoc options.
+
 You can also pass a bare URL as the selector (`mcporter list https://mcp.linear.app/mcp`) or embed the URL in a `call` expression (`mcporter call 'https://mcp.example.com/tools.generate({ topic: "release" })'`).
 
 - Add `--json` to `mcporter list …` when you need a machine-readable summary of status counts and per-server failures, use `--output json`/`--output raw` with `mcporter call` to receive structured `{ server, tool, issue }` envelopes whenever a transport error occurs, and run `mcporter auth … --json` to capture the same envelope if OAuth or transport setup fails.
@@ -34,7 +36,7 @@ Notice that the second command repeats the URL. Ad-hoc definitions are ephemeral
 ## Transport Detection
 
 - **HTTP(S)**: Providing a URL defaults to the streamable HTTP transport. `https://` works out of the box; `http://` requires `--allow-http` (or the hidden alias `--insecure`) to acknowledge cleartext traffic. The `--sse` flag is a hidden alias for `--http-url` to match older examples. Use repeatable `--header KEY=value` flags for private servers that require headers such as `Authorization`, `X-API-Key`, or tenant selectors.
-- **STDIO**: Supplying `--stdio` (with a command string) or `--stdio-bin` (binary + args) selects the stdio transport. Your current shell environment is inherited automatically; use `--env KEY=value` only when you need to inject/override specific variables (and `--cwd` to change directories).
+- **STDIO**: Supplying `--stdio` (a command string, optionally with repeatable `--stdio-arg <value>`) selects the stdio transport. Your current shell environment is inherited automatically; use `--env KEY=value` only when you need to inject/override specific variables (and `--cwd` to change directories).
 - **Conflict guard**: Passing both URL and stdio flags errors out so we don’t guess.
 
 ## Naming & Identity

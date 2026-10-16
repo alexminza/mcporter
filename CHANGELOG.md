@@ -1,6 +1,20 @@
 # mcporter Changelog
 
-## [0.14.4] - Unreleased
+## [0.15.1] - Unreleased
+
+## [0.15.0] - 2026-10-16
+
+**Highlights:** Keep healthy MCP servers available when another server fails, accept inline ad-hoc flags, add runnable MCP examples, and rehearse releases without publishing.
+
+- Keep `mcporter serve` listing tools from healthy servers when another served server fails to list (for example, one that still needs OAuth); the failure is logged to stderr, and `tools/list` still errors when every served server fails. Thanks @vitalijssilins (#447).
+- Accept `--flag=value` for ad-hoc server options, preserve embedded equals signs, keep ad-hoc calls on the runtime path, and document the supported `--stdio-arg` flag. Thanks @notlakshitha (#443, #444).
+- Add an isolated, runnable FXMacroData MCP example for keyless USD indicators and release calendars. Thanks @roberttidball (#445).
+- Add an opt-in Sem stdio MCP example for local repository navigation with an explicit checkout path. Thanks @rs545837 (#440).
+- Default manual Release runs to a no-publish rehearsal of current main: validate, build, pack and smoke-test npm and both macOS architectures, including credential-free signing contract checks.
+- Explicitly ad-hoc sign native rehearsal binaries before verification so Bun's Intel baseline output cannot retain an invalid upstream signature.
+- Refresh Zod, Express fixtures, Vitest, Node/Bun types, and lint/format tooling while preserving Node 24 support, the 48-hour dependency cooldown, the OAuth client patch, and security overrides.
+
+**Verification:** [npm](https://www.npmjs.com/package/mcporter/v/0.15.0), [registry tarball](https://registry.npmjs.org/mcporter/-/mcporter-0.15.0.tgz), [release CI](https://github.com/openclaw/mcporter/actions/runs/38852447046), [native assets](https://github.com/openclaw/mcporter/actions/runs/38851923036), and [browser Gatekeeper proof](https://github.com/openclaw/mcporter/actions/runs/38852027638). npm integrity: `sha512-ts6g/7uhOFzUlKrLyt9yoCAgWyR3ns4kdDA8NkSHzlapc5EzjCNseJkWHplmptQf5zmiSeFr/kSM02LOY7E65w==`.
 
 - Encrypt the OAuth vault's secret values (`access_token`, `refresh_token`, `id_token`, `client_secret`, `registration_access_token`, PKCE verifier, OAuth state) at rest as JWE compact strings (`PBES2-HS512+A256KW` / `A256GCM`), in place in `credentials.json` and in any `tokenCacheDir`, when `MCPORTER_VAULT_PASSWORD` (at least 32 characters, generated) is set; existing values are sealed on the next write and the file format is unchanged. `oauthVaultEncryption: "required"` (or `MCPORTER_VAULT_ENCRYPTION=required`) refuses plaintext in the vault and in `tokenCacheDir`. Sealed values without the password fail closed and are never rewritten or deleted, in the vault and in `tokenCacheDir`, and a plaintext `tokenCacheDir` cannot hide that refusal. Legacy `~/.mcporter/<server>/` caches are removed after migration only when the password is set. Generated CLIs embed the policy of the config they were generated from. Stdio servers (direct or daemon-managed) and the OAuth auth helper are started without the two vault variables. `config doctor` reports sealed and plaintext counts for the vault and for each configured `tokenCacheDir`, and flags a vault file that is not a vault document instead of crashing. Declares the `jose` dependency the MCP client already pulls in. (Issue #408)
 
