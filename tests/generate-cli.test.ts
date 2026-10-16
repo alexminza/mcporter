@@ -339,7 +339,10 @@ describeGenerateCli('generateCli', () => {
         'node',
         ['dist/cli.js', 'generate-cli', '--server', inlineServerDefinition, '--output', altOutput],
         // Tool discovery goes through the vault, and `required` refuses it without a password.
-        { ...execOptions(), env: { ...execOptions().env, MCPORTER_VAULT_PASSWORD: 'generate-cli-test-password-0123' } },
+        {
+          ...execOptions(),
+          env: { ...execOptions().env, MCPORTER_VAULT_PASSWORD: 'generate-cli-test-password-01234' },
+        },
         (error) => {
           if (error) {
             reject(error);

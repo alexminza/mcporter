@@ -13,7 +13,10 @@ export const VAULT_JWE_TYP = 'mcporter-vault+jwe';
 // 99designs/keyring default (about 2 ms per value); readers accept up to the ceiling.
 export const VAULT_PBES2_ITERATIONS = 8192;
 export const VAULT_PBES2_MAX_ITERATIONS = 100_000;
-export const MIN_VAULT_PASSWORD_LENGTH = 16;
+// 32, not a complexity rule: at 8192 PBKDF2 iterations the passphrase's
+// randomness is the whole defense, and 32 characters nudges toward a generated
+// value (`openssl rand -base64 32` yields 44) rather than a memorable one.
+export const MIN_VAULT_PASSWORD_LENGTH = 32;
 // The only values ever sealed; a test checks this list against VaultEntry.
 // `id_token` carries identity claims in clear and secret scanners flag it;
 // `registration_access_token` is the RFC 7592 bearer secret for the client record.
@@ -59,7 +62,7 @@ function readPassword(env: NodeJS.ProcessEnv, name: string): string | undefined 
   if (value.length < MIN_VAULT_PASSWORD_LENGTH) {
     throw new VaultEncryptionError(
       'password_invalid',
-      `${name} must be at least ${MIN_VAULT_PASSWORD_LENGTH} characters; generate one with \`openssl rand -base64 32\`.`
+      `${name} must be at least ${MIN_VAULT_PASSWORD_LENGTH} characters and should be generated, not chosen; use \`openssl rand -base64 32\`.`
     );
   }
   return value;

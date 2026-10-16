@@ -22,7 +22,7 @@ beforeEach(async () => {
   const sealed = await sealVaultSecret(
     'access-enc',
     vaultSecretKid(key, ['tokens', 'access_token']),
-    'cached-auth-password-0123456789'
+    'cached-auth-password-0123456789ab'
   );
   await fs.mkdir(path.dirname(getOAuthVaultPath()), { recursive: true });
   await fs.writeFile(

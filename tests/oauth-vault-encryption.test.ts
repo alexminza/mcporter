@@ -145,6 +145,18 @@ describe('isVaultSecretJwe', () => {
   });
 });
 
+describe('password floor', () => {
+  it('rejects 31 characters and accepts 32, so a memorable passphrase does not pass', () => {
+    const thirtyOne = 'x'.repeat(31);
+    const thirtyTwo = 'x'.repeat(32);
+    expect(MIN_VAULT_PASSWORD_LENGTH).toBe(32);
+    expect(() => readVaultEncryptionSettings({ MCPORTER_VAULT_PASSWORD: thirtyOne })).toThrow(
+      expect.objectContaining({ code: 'password_invalid' })
+    );
+    expect(readVaultEncryptionSettings({ MCPORTER_VAULT_PASSWORD: thirtyTwo }).password).toBe(thirtyTwo);
+  });
+});
+
 describe('VAULT_SECRET_FIELDS and describeVaultSecrets', () => {
   it('names string fields of VaultEntry and counts them', async () => {
     const entry: VaultEntry = {
