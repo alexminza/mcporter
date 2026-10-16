@@ -61,6 +61,53 @@ export function prepareStoredTokens(tokens: OAuthTokens): OAuthTokens {
 const TOKEN_SECRET_FIELDS = ['access_token', 'refresh_token', 'id_token'] as const;
 const CLIENT_SECRET_FIELDS = ['client_secret', 'registration_access_token'] as const;
 
+export interface TokenCacheSecretStats {
+  readonly sealed: number;
+  readonly plaintext: number;
+}
+
+// Counts the secret values in a tokenCacheDir without opening any of them, for
+// `config doctor`; 'absent' when the directory does not exist. Unreadable
+// files count as nothing, as the store itself treats them.
+export async function describeTokenCacheDir(root: string): Promise<TokenCacheSecretStats | 'absent'> {
+  try {
+    await fs.access(root);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return 'absent';
+    throw error;
+  }
+  const stats = { sealed: 0, plaintext: 0 };
+  const count = (value: unknown) => {
+    if (typeof value !== 'string' || value.length === 0) return;
+    if (isVaultSecretJwe(value)) stats.sealed += 1;
+    else stats.plaintext += 1;
+  };
+  const json = async (file: string) => {
+    try {
+      return await readJsonFile(path.join(root, file));
+    } catch (error) {
+      if (error instanceof SyntaxError) return undefined;
+      throw error;
+    }
+  };
+  for (const [file, fields] of [
+    ['tokens.json', TOKEN_SECRET_FIELDS],
+    ['client.json', CLIENT_SECRET_FIELDS],
+  ] as const) {
+    const record = await json(file);
+    if (record && typeof record === 'object') {
+      for (const field of fields) count((record as Record<string, unknown>)[field]);
+    }
+  }
+  count(await json('state.txt'));
+  try {
+    count((await fs.readFile(path.join(root, 'code_verifier.txt'), 'utf8')).trim());
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  return stats;
+}
+
 export class DirectoryPersistence implements OAuthPersistence {
   private readonly tokenPath: string;
   private readonly clientInfoPath: string;

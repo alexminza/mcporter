@@ -1,6 +1,7 @@
 import path from 'node:path';
 import { loadConfigSnapshot } from '../../config.js';
 import { readJsonFile } from '../../fs-json.js';
+import { describeTokenCacheDir } from '../../oauth-persistence-stores.js';
 import { getOAuthVaultPath } from '../../oauth-vault.js';
 import {
   VAULT_ENCRYPTION_POLICY_ENV,
@@ -72,6 +73,40 @@ async function reportVault(issues: string[], configuredPolicy: 'optional' | 'req
   }
 }
 
+// A tokenCacheDir holds the same secrets as the vault; plaintext an older
+// binary leaves there must show up here too.
+async function reportTokenCaches(
+  issues: string[],
+  servers: readonly { name: string; tokenCacheDir?: string }[],
+  configuredPolicy: 'optional' | 'required' | undefined
+): Promise<void> {
+  let password: string | undefined;
+  try {
+    password = readVaultEncryptionSettings(process.env, configuredPolicy).password;
+  } catch (error) {
+    if (!(error instanceof VaultEncryptionError)) throw error;
+    // Already reported by reportVault.
+  }
+  for (const server of servers) {
+    if (!server.tokenCacheDir) continue;
+    const dir = server.tokenCacheDir;
+    const stats = await describeTokenCacheDir(dir);
+    const label = stats === 'absent' ? 'absent' : `${stats.sealed} sealed values, ${stats.plaintext} plaintext values`;
+    console.log(`Token cache ${dir} (${server.name}): ${label}`);
+    if (stats === 'absent') continue;
+    if (stats.sealed > 0 && password === undefined) {
+      issues.push(
+        `Token cache ${dir} holds ${stats.sealed} sealed values but ${VAULT_PASSWORD_ENV} is unset; '${server.name}' will fail until it is set.`
+      );
+    }
+    if (stats.plaintext > 0 && password !== undefined) {
+      issues.push(
+        `Token cache ${dir} holds ${stats.plaintext} plaintext secret values; they are sealed on the next write.`
+      );
+    }
+  }
+}
+
 export async function handleDoctorCommand(options: ConfigCliOptions, _args: string[]): Promise<void> {
   console.log(`MCPorter ${MCPORTER_VERSION}`);
   logConfigLocations(await resolveConfigLocations(options.loadOptions), { leadingNewline: false });
@@ -84,6 +119,7 @@ export async function handleDoctorCommand(options: ConfigCliOptions, _args: stri
     }
   }
   await reportVault(issues, snapshot.vaultEncryption);
+  await reportTokenCaches(issues, snapshot.servers, snapshot.vaultEncryption);
   if (issues.length === 0) {
     console.log('Config looks good.');
     return;

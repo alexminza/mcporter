@@ -135,6 +135,51 @@ describe('config doctor vault state', () => {
       expect(out, body).toContain('not a valid OAuth vault');
     }
   });
+  it('reports sealed and plaintext values in each configured tokenCacheDir', async () => {
+    const cacheDir = path.join(tempDir, 'cache');
+    vi.spyOn(configModule, 'loadConfigSnapshot').mockResolvedValue({
+      servers: [
+        {
+          name: 'cached',
+          command: { kind: 'http', url: new URL('https://example.com/mcp'), headers: {} },
+          auth: 'oauth',
+          tokenCacheDir: cacheDir,
+        },
+      ],
+      daemon: {},
+      vaultEncryption: undefined,
+    });
+    expect(await runDoctor()).toContain(`Token cache ${cacheDir} (cached): absent`);
+
+    await fs.mkdir(cacheDir, { recursive: true });
+    await fs.writeFile(
+      path.join(cacheDir, 'tokens.json'),
+      JSON.stringify({ access_token: 'plain', refresh_token: 'plain-r', token_type: 'Bearer' })
+    );
+    await fs.writeFile(
+      path.join(cacheDir, 'client.json'),
+      JSON.stringify({ client_id: 'c', client_secret: 'plain-s' })
+    );
+    const plain = await runDoctor();
+    expect(plain).toContain(`Token cache ${cacheDir} (cached): 0 sealed values, 3 plaintext values`);
+    expect(plain).not.toContain('plaintext secret values');
+    vi.stubEnv('MCPORTER_VAULT_PASSWORD', PASSWORD);
+    expect(await runDoctor()).toContain(`Token cache ${cacheDir} holds 3 plaintext secret values`);
+
+    vi.unstubAllEnvs();
+    await fs.writeFile(
+      path.join(cacheDir, 'tokens.json'),
+      JSON.stringify({
+        access_token: await sealVaultSecret('a', 'tokens.json/access_token', PASSWORD),
+        refresh_token: await sealVaultSecret('r', 'tokens.json/refresh_token', PASSWORD),
+        token_type: 'Bearer',
+      })
+    );
+    const mixed = await runDoctor();
+    expect(mixed).toContain(`Token cache ${cacheDir} (cached): 2 sealed values, 1 plaintext values`);
+    expect(mixed).toContain(`Token cache ${cacheDir} holds 2 sealed values but MCPORTER_VAULT_PASSWORD is unset`);
+  });
+
   it('reports unreadable vaults and settings errors as issues', async () => {
     await writeVaultFile('{"version":1,"entries": { bad');
     expect(await runDoctor()).toContain('(unreadable)');
