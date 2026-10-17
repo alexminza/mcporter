@@ -3,6 +3,7 @@
 ## [0.15.1] - Unreleased
 
 - Update Rolldown to 1.2.14 for generated CLI bundling, preserving Node 24 support and the 48-hour dependency cooldown.
+- Add opt-in OAuth secret encryption with `MCPORTER_VAULT_PASSWORD`, a required policy, persistent encryption markers, migration on write, and vault/token-cache diagnostics. Older binaries must use a separate state directory after opt-in; see the downgrade instructions. Thanks @alexminza (#425, #408).
 
 ## [0.15.0] - 2026-10-16
 

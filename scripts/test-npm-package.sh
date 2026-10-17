@@ -28,3 +28,12 @@ for (const name of ['callOnce', 'createRuntime', 'createServerProxy']) {
 NODE
 )
 node "$ROOT/scripts/verify-packaged-oauth.mjs" "$WORK/consumer/node_modules/mcporter"
+node "$ROOT/scripts/verify-packaged-vault.mjs" "$WORK/consumer/node_modules/mcporter"
+
+# Keep the supported rollback procedure honest against the last plaintext release.
+mkdir -p "$WORK/previous"
+HOME="$WORK/home" NPM_CONFIG_USERCONFIG="$WORK/empty-npmrc" \
+  npm install --prefix "$WORK/previous" --ignore-scripts --no-audit --no-fund --package-lock=false \
+    --registry=https://registry.npmjs.org/ mcporter@0.15.0
+node "$ROOT/scripts/test-vault-downgrade.mjs" \
+  "$WORK/previous/node_modules/mcporter" "$WORK/consumer/node_modules/mcporter"

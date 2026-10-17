@@ -49,7 +49,7 @@ mcporter honors XDG Base Directory env vars for its own paths when they are expl
 | Kind   | Env var           | mcporter path                                   | Legacy fallback      |
 | ------ | ----------------- | ----------------------------------------------- | -------------------- |
 | config | `XDG_CONFIG_HOME` | `$XDG_CONFIG_HOME/mcporter/mcporter.json[c]`    | `~/.mcporter/...`    |
-| data   | `XDG_DATA_HOME`   | `$XDG_DATA_HOME/mcporter/credentials.json`      | `~/.mcporter/...`    |
+| data   | `XDG_DATA_HOME`   | `$XDG_DATA_HOME/mcporter/credentials.json`      | `~/.mcporter/...`    | — see [Vault Encryption](#vault-encryption) |
 | cache  | `XDG_CACHE_HOME`  | `$XDG_CACHE_HOME/mcporter/<server>/schema.json` | `~/.mcporter/...`    |
 | state  | `XDG_STATE_HOME`  | `$XDG_STATE_HOME/mcporter/...`                  | `~/.mcporter/daemon` |
 
@@ -210,10 +210,11 @@ The schema is auto-generated from the Zod validation schemas using `pnpm generat
 
 Top-level structure:
 
-| Key          | Type     | Description                                                                                                            |
-| ------------ | -------- | ---------------------------------------------------------------------------------------------------------------------- |
-| `mcpServers` | object   | Map of server names → definitions. Required even if empty.                                                             |
-| `imports`    | string[] | Optional list of import kinds. Empty array disables imports entirely; omitting the key falls back to the default list. |
+| Key                    | Type     | Description                                                                                                                  |
+| ---------------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `mcpServers`           | object   | Map of server names → definitions. Required even if empty.                                                                   |
+| `imports`              | string[] | Optional list of import kinds. Empty array disables imports entirely; omitting the key falls back to the default list.       |
+| `oauthVaultEncryption` | string   | `"optional"` (default) or `"required"`; see [Vault Encryption](#vault-encryption). `MCPORTER_VAULT_ENCRYPTION` overrides it. |
 
 Server definition fields (subset of what `RawEntrySchema` accepts):
 
@@ -292,6 +293,28 @@ For keep-alive stdio servers, refresh happens before process start. If that proc
 
 - Machine-specific additions can live in `~/.mcporter/local.json` or `$XDG_CONFIG_HOME/mcporter/local.json`; point `mcporter config --config ~/.mcporter/local.json add ...` there when you prefer not to touch the repo. Since the runtime only watches one config at a time, CI jobs should always pass `--config config/mcporter.json` (or run from the repo root) for deterministic behavior.
 - OAuth tokens, cached server metadata, and generated CLIs should remain outside the repo (`~/.mcporter/...` or the matching `XDG_*_HOME/mcporter/...`, plus `dist/`).
+
+## Vault Encryption
+
+> **Before opting in:** upgrade and restart every CLI, daemon, and generated CLI that shares the vault or a `tokenCacheDir`. Older binaries do not enforce encryption: re-authentication can silently put plaintext credentials back on disk. A format marker cannot stop already-released code from doing that. Do not downgrade or mix those versions against an encrypted profile; use the isolated rollback procedure below.
+
+The OAuth vault (`credentials.json`, see the XDG table above) is plaintext JSON by default. Set `MCPORTER_VAULT_PASSWORD` to store each secret value in it (`access_token`, `refresh_token`, `id_token`, `client_secret`, `registration_access_token`, the PKCE verifier and OAuth state) as an RFC 7516 JWE compact string in place: `PBES2-HS512+A256KW`, `A256GCM`, 8192 PBKDF2 iterations. The JSON document retains version 2 and gains an `encryption: { "version": 1 }` marker; server names, URLs, client IDs and timestamps stay readable, and any JOSE library can decrypt a value with the password (`jose` for Node needs `PBES2-HS512+A256KW` in `keyManagementAlgorithms`). The password must be generated, not chosen: with 8192 key-derivation iterations its randomness is the whole protection against an offline guess at a copied file. It must be at least 32 characters; `openssl rand -base64 32` produces a suitable value.
+
+- Existing plaintext values are read as before and encrypted the next time a login is added or renewed (a token refresh, `mcporter auth`, `mcporter vault set`); until then they stay plain. `mcporter config doctor` shows how many values are still plain, in the vault and in each configured `tokenCacheDir`.
+- Once marked, the vault requires the password even after its last entry is cleared. A `tokenCacheDir` records the same choice in `encryption.json`. Supporting versions refuse unknown encryption-marker versions without repairing or overwriting them. Sealed values from unmarked stores are also recognized and refused without the password.
+- There is no password rotation: with a new password the stored values no longer open; run `mcporter vault clear <server>` and log in again. Restart `mcporter daemon` after changing these variables.
+- `oauthVaultEncryption: "required"` in `mcporter.json` (or `MCPORTER_VAULT_ENCRYPTION=required`, which overrides the config key) refuses every vault operation while the password is unset, so a cleared environment cannot write plaintext values. Default `optional`. The config key applies to servers defined in config; ad-hoc servers (`mcporter auth <url>`) follow `MCPORTER_VAULT_ENCRYPTION` only. A CLI generated with `mcporter generate-cli` embeds the policy of the config file or definition it was generated from, and generating under `required` needs the password set, because tool discovery goes through the vault.
+- Tokens saved by older versions under `~/.mcporter/<server>/` are copied into the vault the first time the server is used, as before. With the password set the old plaintext files are removed after the copy; without it they stay.
+- Servers with a `tokenCacheDir` get the same treatment: the secret values in `tokens.json`, `client.json`, `code_verifier.txt` and `state.txt` are encrypted, and the first write with the password set (any write, including the discovery metadata) encrypts every one of those files that is still plain; the other files there are not secrets. Without the password, a directory that holds encrypted values refuses every write and delete and is never modified, as the vault is. The `required` policy refuses the directory too, and a plaintext directory never hides a vault that needs the password.
+- Stdio MCP servers, whether started directly or by the keep-alive daemon, and the OAuth auth helper are started without `MCPORTER_VAULT_PASSWORD` and `MCPORTER_VAULT_ENCRYPTION` in their environment; everything else they inherit is unchanged, and a value set in a server's own `env` still applies.
+
+### Downgrade and rollback
+
+There is no in-place plaintext downgrade or password rotation command. Unsetting the password is not a rollback. The markers protect supporting versions, but old binaries ignore them (and an unknown top-level vault version is treated as corrupt and rewritten by those binaries). Neither the marker nor `required` can impose a policy on code released before this feature.
+
+To run an older version safely, stop the daemon and all consumers of the encrypted profile, preserve that profile and its password, and run the older binary with a **different `HOME`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME`, and `XDG_STATE_HOME`**. Use a fresh config in that profile; remove or change every explicit `tokenCacheDir` so it cannot point back into the encrypted profile. Authenticate again there, accepting that the old version stores those new credentials in plaintext. Do not copy encrypted credentials into the old profile. To roll forward, stop the old consumers, restore the original environment and password, and restart the supporting version against the preserved encrypted profile.
+
+If an older consumer has already written plaintext into the encrypted profile, stop it, restore the supporting version and password, and trigger a credential write to seal the whole store again. Run `mcporter config doctor` to check for residue. Sealing cannot undo exposure in backups or copies made during that window; revoke affected credentials at their providers if needed.
 
 ## Validation & Troubleshooting
 
